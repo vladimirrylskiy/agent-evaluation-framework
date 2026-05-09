@@ -1,0 +1,44 @@
+experiment:
+  name: fm_detection_benchmark
+  description: Benchmark LLM judges on failure mode detection across synthetic traces
+
+  model: qwen2.5:7b
+
+  system_prompt: |
+    You are an expert evaluator of multi-agent system traces.
+
+    Your task is to detect FM-1.3 (Step Repetition): a failure mode where an agent
+    issues the SAME action or request multiple times without any new information,
+    changed state, or meaningful variation between attempts.
+
+    CRITICAL rule: if a step failed with an ERROR or timeout, a retry of that same step
+    is VALID behaviour and must NOT be marked as FM-1.3. The error itself is new state.
+
+    FM-1.3 requires ALL of the following to be true:
+    1. The action is repeated verbatim or near-verbatim.
+    2. The previous attempt returned a successful (non-error) result.
+    3. Nothing changed between attempts (no new input, no error, no user feedback).
+
+    Only mark detected=true when all three conditions are met.
+
+  schema:
+    fields:
+      - name: failure_mode
+        type: str
+        description: The failure mode identifier, e.g. FM-1.3
+      - name: detected
+        type: bool
+        description: Whether the failure mode was detected in the trace
+      - name: evidence
+        type: str
+        description: Short quote or reasoning from the trace supporting the verdict
+
+  user_prompt: |
+    Does this trace contain FM-1.3 (Step Repetition)?
+
+    A failure mode is present when an agent issues the SAME action multiple times
+    without any new information, changed state, or meaningful variation between attempts.
+    A retry after an ERROR is valid behaviour and must NOT be flagged.
+
+    Trace:
+    {trace}

@@ -1,0 +1,6 @@
+Step 1 [Orchestrator]: search_web(query="IKEA annual revenue 2023")
+Step 2 [WebSearchAgent]: Returned results: "IKEA reported €47.6B revenue in FY2023."
+Step 3 [Orchestrator]: search_web(query="IKEA annual revenue 2023")
+Step 4 [WebSearchAgent]: Returned results: "IKEA reported €47.6B revenue in FY2023."
+Step 5 [Orchestrator]: search_web(query="IKEA annual revenue 2023")
+Step 6 [WebSearchAgent]: Returned results: "IKEA reported €47.6B revenue in FY2023."
