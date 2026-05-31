@@ -1,77 +1,46 @@
-"""
-Run a failure-mode detection experiment driven by config.yaml.
-Trace is loaded from data/splits/dev/.
-"""
+from LLM_models_interface.llm_interface import load_config, LLMJudge
+import pickle
+import os
+import glob    
+import pandas as pd                        
 
-import json
-import sys
-from pathlib import Path
-from typing import Any
+cfg = load_config("LLM_models_interface/experiments_template/config.yaml")                                                           
+judge = LLMJudge(cfg)
 
-import yaml
-from pydantic import BaseModel, create_model
+dirname = 'saved_results'
+os.makedirs(dirname, exist_ok=True)
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from llm_interface import judge
+trace_files = sorted(glob.glob(os.path.join(cfg.dataset_path, "*.txt")))                                                             
+traces = [(os.path.splitext(os.path.basename(f))[0], open(f).read()) for f in trace_files]      
 
+results = []
+for trace_id, trace_text in traces:
+    
+    if len(trace_text) + len(judge.examples) > 1048570:
+            trace_text = trace_text[:1048570 - len(judge.examples)]
 
-REPO_ROOT = Path(__file__).parent.parent.parent
-TRACE = (REPO_ROOT / "data" / "splits" / "dev" / "trace_dummy.txt").read_text()
+    try:
+        response = judge.judge_trace(trace_id, trace_text)
+        results.append(response)
+        
+        # Save the current results after each evaluation
+        with open(f'{dirname}/o1_results_checkpoint.pkl', 'wb') as f:
+            pickle.dump(results, f)
+            
+        # Optional: Save a backup copy every 10 evaluations
+        if len(results) % 10 == 0:
+            with open(f'{dirname}/o1_results_backup_{len(results)}.pkl', 'wb') as f:
+                pickle.dump(results, f)
+                
+        print(f"Completed and saved evaluation {len(results)}/{len(traces)}")
+    except Exception as e:
+        print(f"Error on evaluation {len(results)}: {str(e)}")
+        # Save results even if there's an error
+        with open(f'{dirname}/o1_results_checkpoint.pkl', 'wb') as f:
+            pickle.dump(results, f)
 
-_TYPE_MAP = {"str": str, "bool": bool, "int": int, "float": float}
-
-
-def build_schema(schema_cfg: dict) -> type[BaseModel]:
-    fields: dict[str, Any] = {
-        f["name"]: (_TYPE_MAP[f["type"]], ...)
-        for f in schema_cfg["fields"]
-    }
-    return create_model("DetectionResult", **fields)
-
-
-def load_config(path: Path) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
-
-
-def run(config_path: Path = Path(__file__).parent / "config.yaml"):
-    config = load_config(config_path)
-    exp = config["experiment"]
-
-    model = exp["model"]
-    system_prompt = exp["system_prompt"]
-    schema = build_schema(exp["schema"])
-    user_prompt = exp["user_prompt"].format(trace=TRACE)
-
-    print(f"Experiment : {exp['name']}")
-    print(f"Description: {exp['description']}")
-    print(f"Model      : {model}\n")
-
-    resp = judge(
-        model=model,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        schema=schema,
-    )
-
-    parsed_fields = resp.parsed.model_dump() if resp.parsed else {"raw_text": resp.raw_text}
-    for key, val in parsed_fields.items():
-        print(f"{key.capitalize():<12}: {val}")
-    print(f"Cost        : ${resp.cost_usd:.6f}  |  Latency: {resp.latency_s:.2f}s")
-
-    output_path = Path(__file__).parent / "results.jsonl"
-    record = {
-        "model": model,
-        **parsed_fields,
-        "tokens_in": resp.tokens_in,
-        "tokens_out": resp.tokens_out,
-        "cost_usd": resp.cost_usd,
-        "latency_s": resp.latency_s,
-    }
-    with open(output_path, "a") as f:
-        f.write(json.dumps(record) + "\n")
-    print(f"\nResult appended to {output_path}")
-
-
-if __name__ == "__main__":
-    run()
+rows = [{"trace_id": r.trace_id, "model": r.model_id,
+           "tokens_in": r.tokens_in, "tokens_out": r.tokens_out,
+           "latency_s": r.latency_s, "cost_usd": r.cost_usd,
+           **r.annotations} for r in results]
+pd.DataFrame(rows).to_csv(f"{dirname}/{cfg.model}.csv", index=False)
