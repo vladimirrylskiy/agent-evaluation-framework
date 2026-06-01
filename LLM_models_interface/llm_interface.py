@@ -40,7 +40,7 @@ FAILURE_MODES = ["1.1","1.2","1.3","1.4","1.5","2.1","2.2","2.3","2.4","2.5","2.
 @dataclass
 class JudgeConfig:
     model: str
-    backend: str = "genai"   # "genai" | "ollama"
+    backend: str = "genai"   # "genai" | "anthropic" | "ollama"
     temperature: float = 0.0
     reasoning: bool = False
     shots: int = 0
@@ -261,7 +261,7 @@ def _call_genai(model: str, prompt: str, temperature: float, trace_id: str, proj
         latency_s=latency
     )
 
-def _call_anthropic_vertex(model: str, prompt: str, temperature: float, trace_id: str, project: str, location: str, system_prompt: str = "", max_tokens: int = 4096) -> JudgeResponse:
+def _call_anthropic_vertex(model: str, prompt: str, temperature: float, trace_id: str, project: str, location: str, system_prompt: str = "", reasoning: bool = False, max_tokens: int = 16000) -> JudgeResponse:
     """Call a Claude model hosted on Vertex AI Model Garden."""
 
     client = AnthropicVertex(
@@ -273,9 +273,13 @@ def _call_anthropic_vertex(model: str, prompt: str, temperature: float, trace_id
     kwargs = {
         "model": model,
         "max_tokens": max_tokens,
-        "temperature": temperature,
         "messages": [{"role": "user", "content": prompt}],
     }
+    if reasoning:
+        # Extended thinking requires budget_tokens and disables temperature
+        kwargs["thinking"] = {"type": "enabled", "budget_tokens": 10000}
+    else:
+        kwargs["temperature"] = temperature
     if system_prompt:
         kwargs["system"] = system_prompt
 
@@ -283,7 +287,7 @@ def _call_anthropic_vertex(model: str, prompt: str, temperature: float, trace_id
     response = client.messages.create(**kwargs)
     latency = time.perf_counter() - t0
 
-    raw = response.content[0].text if response.content else ""
+    raw = next((b.text for b in response.content if b.type == "text"), "")
     return JudgeResponse(
         trace_id=trace_id,
         raw_text=raw,
@@ -434,23 +438,25 @@ def load_dataset(config: JudgeConfig) -> list[dict]:
 _MODULE_DIR = Path(__file__).parent
 
 class LLMJudge:
-      def __init__(self, config: JudgeConfig):
-          self.config = config
-          self.definitions = (_MODULE_DIR / config.definitions_path).read_text()
-          self.examples = (_MODULE_DIR / config.examples_path).read_text() if config.examples_path else ""
+    def __init__(self, config: JudgeConfig):
+        self.config = config
+        self.definitions = (_MODULE_DIR / config.definitions_path).read_text()
+        self.examples = (_MODULE_DIR / config.examples_path).read_text() if config.examples_path else ""
 
-      def judge_trace(self, trace_id: str, trace_text: str) -> JudgeResponse:
-          examples = self.examples if self.config.shots > 0 else ""
-          prompt = build_judge_prompt(trace_text, self.definitions, examples)
-          response = self._dispatch(prompt, trace_id)
-          response.annotations = parse_14_modes(response.raw_text)
-          return response
+    def judge_trace(self, trace_id: str, trace_text: str) -> JudgeResponse:
+        examples = self.examples if self.config.shots > 0 else ""
+        prompt = build_judge_prompt(trace_text, self.definitions, examples)
+        response = self._dispatch(prompt, trace_id)
+        response.annotations = parse_14_modes(response.raw_text)
+        return response
 
-      def _dispatch(self, prompt, trace_id) -> JudgeResponse:
-          if self.config.backend == "ollama":                                                                                              
-            return _call_ollama(self.config.model, prompt, self.config.temperature, trace_id, self.config.ollama_host, self.config.system_prompt)                   
-          if self.config.model.startswith("claude"):
+    def _dispatch(self, prompt, trace_id) -> JudgeResponse:
+        if self.config.backend == "ollama":
+            return _call_ollama(self.config.model, prompt, self.config.temperature, trace_id, self.config.ollama_host, self.config.system_prompt)
+        if self.config.backend == "anthropic":
             return _call_anthropic_vertex(self.config.model, prompt, self.config.temperature, trace_id,
-                     self.config.genai_project, self.config.genai_location, self.config.system_prompt)
-          return _call_genai(self.config.model, prompt, self.config.temperature, trace_id,
-                   self.config.genai_project, self.config.genai_location, self.config.system_prompt, self.config.reasoning)
+                    self.config.genai_project, self.config.genai_location, self.config.system_prompt, self.config.reasoning)
+        if self.config.backend == "genai":
+            return _call_genai(self.config.model, prompt, self.config.temperature, trace_id,
+                    self.config.genai_project, self.config.genai_location, self.config.system_prompt, self.config.reasoning)
+        raise ValueError(f"Unknown backend: {self.config.backend!r}. Use 'genai', 'anthropic', or 'ollama'.")
