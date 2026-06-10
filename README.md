@@ -2,12 +2,57 @@
 
 This is the repo for our bachelor thesis project (UvA × IKEA). We are researching failure modes in multi-agent system (MAS) traces, using the [MAD dataset](https://huggingface.co/datasets/mcemri/MAST-Data) and the MAST taxonomy of 14 failure modes.
 
+## Quickstart
+
+```bash
+# 1. Clone the repository
+git clone <repo>
+cd agent-evaluation-framework
+
+# 2. Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Download the MAD datasets
+# (see section below)
+
+# 5. Authenticate for Vertex AI models
+gcloud auth application-default login
+
+# 6. Configure an experiment
+cp -r experiments/stage1_llm_judge/experiments_template \
+      experiments/stage1_llm_judge/my_experiment
+
+# Edit config.yaml
+
+# 7. Run the notebook
+jupyter notebook llm_judge_pipeline.ipynb
+```
 ## Setup
 
 ```bash
 git clone <repo>
 python -m venv .venv && source .venv/bin/activate 
 pip install -r requirements.txt
+```
+
+### Download the MAD datasets
+
+The repository does not ship the MAD dataset files. After installing the requirements, download the data from Hugging Face:
+
+```python
+from huggingface_hub import hf_hub_download
+import os
+import shutil
+
+os.makedirs("data/MAST-Data", exist_ok=True)
+
+for fn in ["MAD_full_dataset.json", "MAD_human_labelled_dataset.json"]:
+    p = hf_hub_download(repo_id="mcemri/MAD", filename=fn, repo_type="dataset")
+    shutil.copy(os.path.realpath(p), os.path.join("data/MAST-Data", fn))
 ```
 
 **Credentials** depend on which backend you use:
