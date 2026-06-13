@@ -135,6 +135,9 @@ with st.sidebar:
     )
     
     run_judge = st.button("🔍 Run Judge (Full + Localized)", use_container_width=True)
+    st.divider()
+    run_partial = st.button("📊 Run Partial-Trace Detection", use_container_width=True)
+    st.caption("Runs the judge on 25 %, 50 %, 75 %, 100 % prefixes (3 extra calls). Uses the selected model.")
 
 # ============================================================================
 # MAIN: Display Trace & Results
@@ -404,6 +407,123 @@ with col2:
                 st.error(f"Error running judge: {e}")
                 import traceback
                 st.write(traceback.format_exc())
+
+# ============================================================================
+# 3️⃣ PARTIAL-TRACE DETECTION
+# ============================================================================
+if run_partial:
+    st.markdown("---")
+    st.subheader("3️⃣ Partial-Trace Detection")
+    st.caption(
+        "The judge runs on growing prefixes of the trace (25 %, 50 %, 75 %, 100 %). "
+        "The 100 % run is the reference verdict. For each failure mode, the table shows "
+        "the smallest prefix at which the verdict converges to — and stays at — the full-trace verdict."
+    )
+
+    import pandas as pd
+
+    FRACTIONS = [0.25, 0.50, 0.75, 1.00]
+    LABELS = {0.25: "25%", 0.50: "50%", 0.75: "75%", 1.00: "100%"}
+
+    n_steps = len(selected_trace["steps"])
+    prefix_sizes = {frac: max(1, round(n_steps * frac)) for frac in FRACTIONS}
+    st.caption(
+        f"Trace has **{n_steps}** steps → prefix sizes: "
+        + ", ".join(f"{LABELS[f]} = {prefix_sizes[f]} steps" for f in FRACTIONS)
+    )
+
+    defs_path_p = Path("data/prompts/definitions.txt")
+    examples_path_p = Path("data/prompts/examples.txt")
+    definitions_p = defs_path_p.read_text() if defs_path_p.exists() else ""
+    examples_p = examples_path_p.read_text() if examples_path_p.exists() else ""
+
+    verdicts_by_frac: dict[float, dict[str, int]] = {}
+    progress_bar = st.progress(0, text="Starting…")
+
+    for step_i, frac in enumerate(FRACTIONS):
+        n = prefix_sizes[frac]
+        steps_subset = selected_trace["steps"][:n]
+        trace_text_p = "\n".join(
+            f"[Step {s.get('metadata', {}).get('step_index', i)}] "
+            f"{s.get('agent', 'Unknown')}: {s.get('content', '')}"
+            for i, s in enumerate(steps_subset)
+        )
+        progress_bar.progress(
+            step_i / len(FRACTIONS),
+            text=f"Running {LABELS[frac]} prefix ({n}/{n_steps} steps)…",
+        )
+        config_p = JudgeConfig(
+            name=f"partial_{frac}_{datetime.now().isoformat()}",
+            model=model,
+            backend=backend,
+            temperature=0.0,
+            definitions_path=str(defs_path_p),
+            examples_path=str(examples_path_p),
+        )
+        judge_p = LLMJudge(config_p)
+        prompt_p = build_judge_prompt(trace_text_p, definitions_p, examples_p)
+        try:
+            resp_p = judge_p._dispatch(prompt_p, f"trace_{selected_idx}_frac{frac}")
+            verdicts_by_frac[frac] = parse_14_modes(resp_p.raw_text)
+        except Exception as e:
+            st.error(f"Error at {LABELS[frac]}: {e}")
+            verdicts_by_frac[frac] = {m: -1 for m in FAILURE_MODES}
+
+    progress_bar.progress(1.0, text="Done.")
+    progress_bar.empty()
+
+    # Build table
+    ref = verdicts_by_frac.get(1.00, {})
+    rows_partial = []
+    for mode in FAILURE_MODES:
+        target = ref.get(mode, -1)
+        row = {"FM": mode}
+        for frac in FRACTIONS:
+            v = verdicts_by_frac.get(frac, {}).get(mode, -1)
+            row[LABELS[frac]] = "✅" if v == 1 else ("❌" if v == 0 else "?")
+
+        # Convergence: smallest prefix where this and all subsequent fractions match target
+        conv_label = "—"
+        if target != -1:
+            for i, frac in enumerate(FRACTIONS):
+                if all(
+                    verdicts_by_frac.get(f, {}).get(mode, -1) == target
+                    for f in FRACTIONS[i:]
+                ):
+                    conv_label = LABELS[frac]
+                    break
+        row["Converges at"] = conv_label
+        rows_partial.append(row)
+
+    df_partial = pd.DataFrame(rows_partial).set_index("FM")
+
+    def _highlight_convergence(row: pd.Series) -> pd.Series:
+        conv = row["Converges at"]
+        return pd.Series(
+            {
+                col: (
+                    "background-color: #c6efce; font-weight: bold"
+                    if col == conv and col != "Converges at"
+                    else ""
+                )
+                for col in row.index
+            }
+        )
+
+    st.dataframe(
+        df_partial.style.apply(_highlight_convergence, axis=1),
+        use_container_width=True,
+    )
+
+    # Convergence summary
+    conv_counts: dict[str, int] = {}
+    for row in rows_partial:
+        c = row["Converges at"]
+        conv_counts[c] = conv_counts.get(c, 0) + 1
+
+    cols_summary = st.columns(len(FRACTIONS) + 1)
+    for col_ui, label in zip(cols_summary, list(LABELS.values()) + ["—"]):
+        col_ui.metric(label, f"{conv_counts.get(label, 0)} modes")
 
 st.markdown("---")
 st.caption(
