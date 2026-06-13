@@ -81,36 +81,38 @@ with st.sidebar:
     if human_path.exists():
         with open(human_path, "r", encoding="utf-8") as f:
             human_data = json.load(f)
-        # Build mapping: trace_id -> {mode -> human_verdict}
+        # Build mapping: (mas_name, trace_id) -> {mode -> human_verdict}
         for trace in human_data:
-            trace_id = str(trace.get('trace_id', ''))
-            human_labels[trace_id] = {}
+            key = (str(trace.get('mas_name', '')), str(trace.get('trace_id', '')))
+            human_labels[key] = {}
             for anno in trace.get('annotations', []):
                 mode_name = anno.get('failure mode', '')
                 # Extract mode code (e.g., "1.1" from "1.1 Poor task...")
                 mode_code = mode_name.split()[0] if mode_name else ''
                 if mode_code in FAILURE_MODES:
                     # True if any annotator marked it
-                    verdict = (anno.get('annotator_1', False) or 
-                              anno.get('annotator_2', False) or 
+                    verdict = (anno.get('annotator_1', False) or
+                              anno.get('annotator_2', False) or
                               anno.get('annotator_3', False))
-                    human_labels[trace_id][mode_code] = 1 if verdict else 0
+                    human_labels[key][mode_code] = 1 if verdict else 0
         st.info(f"Loaded {len(human_labels)} human-labeled traces for comparison.")
     
     trace_options = []
     for i, t in enumerate(all_traces):
         trace_id = str(t['metadata'].get('trace_id', f'trace_{i}'))
-        human_badge = " ✅" if trace_id in human_labels else ""
+        mas_name = str(t['metadata'].get('mas_name', ''))
+        human_badge = " ✅" if (mas_name, trace_id) in human_labels else ""
         trace_options.append(
             f"{i}: {trace_id} ({len(t['steps'])} steps){human_badge}"
         )
 
-    selected_idx = st.selectbox("Select a trace", range(len(all_traces)), 
+    selected_idx = st.selectbox("Select a trace", range(len(all_traces)),
                                  format_func=lambda i: trace_options[i])
-    
+
     selected_trace = all_traces[selected_idx]
     selected_trace_id = str(selected_trace['metadata'].get('trace_id', ''))
-    has_human_label = selected_trace_id in human_labels
+    selected_mas_name = str(selected_trace['metadata'].get('mas_name', ''))
+    has_human_label = (selected_mas_name, selected_trace_id) in human_labels
 
     if has_human_label:
         st.success("This trace has human labels.")
@@ -164,9 +166,9 @@ with col1:
 with col2:
     st.subheader("🎯 Judge Results")
     
-    if not run_judge:
-        st.info("Configure and click '🔍 Run Judge' to see results.")
-    else:
+    if not run_judge and not run_partial:
+        st.info("Configure and click a button in the sidebar to see results.")
+    elif run_judge:
         with st.spinner("Running judge (this may take a moment)..."):
             try:
                 # Load definitions and examples
@@ -313,7 +315,7 @@ with col2:
                     st.write("#### 👥 Human-Labeled Comparison")
                     st.caption("Comparing judges against human annotations (majority vote of 3 annotators).")
 
-                    human_anno = human_labels[selected_trace_id]
+                    human_anno = human_labels[(selected_mas_name, selected_trace_id)]
 
                     comparison_data = []
                     full_agree_human = 0
@@ -408,122 +410,137 @@ with col2:
                 import traceback
                 st.write(traceback.format_exc())
 
-# ============================================================================
-# 3️⃣ PARTIAL-TRACE DETECTION
-# ============================================================================
-if run_partial:
-    st.markdown("---")
-    st.subheader("3️⃣ Partial-Trace Detection")
-    st.caption(
-        "The judge runs on growing prefixes of the trace (25 %, 50 %, 75 %, 100 %). "
-        "The 100 % run is the reference verdict. For each failure mode, the table shows "
-        "the smallest prefix at which the verdict converges to — and stays at — the full-trace verdict."
-    )
-
-    import pandas as pd
-
-    FRACTIONS = [0.25, 0.50, 0.75, 1.00]
-    LABELS = {0.25: "25%", 0.50: "50%", 0.75: "75%", 1.00: "100%"}
-
-    n_steps = len(selected_trace["steps"])
-    prefix_sizes = {frac: max(1, round(n_steps * frac)) for frac in FRACTIONS}
-    st.caption(
-        f"Trace has **{n_steps}** steps → prefix sizes: "
-        + ", ".join(f"{LABELS[f]} = {prefix_sizes[f]} steps" for f in FRACTIONS)
-    )
-
-    defs_path_p = Path("data/prompts/definitions.txt")
-    examples_path_p = Path("data/prompts/examples.txt")
-    definitions_p = defs_path_p.read_text() if defs_path_p.exists() else ""
-    examples_p = examples_path_p.read_text() if examples_path_p.exists() else ""
-
-    verdicts_by_frac: dict[float, dict[str, int]] = {}
-    progress_bar = st.progress(0, text="Starting…")
-
-    for step_i, frac in enumerate(FRACTIONS):
-        n = prefix_sizes[frac]
-        steps_subset = selected_trace["steps"][:n]
-        trace_text_p = "\n".join(
-            f"[Step {s.get('metadata', {}).get('step_index', i)}] "
-            f"{s.get('agent', 'Unknown')}: {s.get('content', '')}"
-            for i, s in enumerate(steps_subset)
+    if run_partial:
+        st.markdown("---")
+        st.subheader("3️⃣ Partial-Trace Detection")
+        st.caption(
+            "The judge runs on growing prefixes of the trace (25 %, 50 %, 75 %, 100 %). "
+            "The 100 % run is the reference verdict. For each failure mode, the table shows "
+            "the smallest prefix at which the verdict converges to — and stays at — the full-trace verdict."
         )
-        progress_bar.progress(
-            step_i / len(FRACTIONS),
-            text=f"Running {LABELS[frac]} prefix ({n}/{n_steps} steps)…",
-        )
-        config_p = JudgeConfig(
-            name=f"partial_{frac}_{datetime.now().isoformat()}",
-            model=model,
-            backend=backend,
-            temperature=0.0,
-            definitions_path=str(defs_path_p),
-            examples_path=str(examples_path_p),
-        )
-        judge_p = LLMJudge(config_p)
-        prompt_p = build_judge_prompt(trace_text_p, definitions_p, examples_p)
         try:
-            resp_p = judge_p._dispatch(prompt_p, f"trace_{selected_idx}_frac{frac}")
-            verdicts_by_frac[frac] = parse_14_modes(resp_p.raw_text)
-        except Exception as e:
-            st.error(f"Error at {LABELS[frac]}: {e}")
-            verdicts_by_frac[frac] = {m: -1 for m in FAILURE_MODES}
+            FRACTIONS = [0.25, 0.50, 0.75, 1.00]
+            LABELS = {0.25: "25%", 0.50: "50%", 0.75: "75%", 1.00: "100%"}
 
-    progress_bar.progress(1.0, text="Done.")
-    progress_bar.empty()
+            n_steps = len(selected_trace["steps"])
+            prefix_sizes = {frac: max(1, round(n_steps * frac)) for frac in FRACTIONS}
+            st.caption(
+                f"Trace has **{n_steps}** steps → prefix sizes: "
+                + ", ".join(f"{LABELS[f]} = {prefix_sizes[f]} steps" for f in FRACTIONS)
+            )
 
-    # Build table
-    ref = verdicts_by_frac.get(1.00, {})
-    rows_partial = []
-    for mode in FAILURE_MODES:
-        target = ref.get(mode, -1)
-        row = {"FM": mode}
-        for frac in FRACTIONS:
-            v = verdicts_by_frac.get(frac, {}).get(mode, -1)
-            row[LABELS[frac]] = "✅" if v == 1 else ("❌" if v == 0 else "?")
+            defs_path_p = Path("data/prompts/definitions.txt")
+            examples_path_p = Path("data/prompts/examples.txt")
+            definitions_p = defs_path_p.read_text() if defs_path_p.exists() else ""
+            examples_p = examples_path_p.read_text() if examples_path_p.exists() else ""
 
-        # Convergence: smallest prefix where this and all subsequent fractions match target
-        conv_label = "—"
-        if target != -1:
-            for i, frac in enumerate(FRACTIONS):
-                if all(
-                    verdicts_by_frac.get(f, {}).get(mode, -1) == target
-                    for f in FRACTIONS[i:]
-                ):
-                    conv_label = LABELS[frac]
-                    break
-        row["Converges at"] = conv_label
-        rows_partial.append(row)
+            verdicts_by_frac: dict[float, dict[str, int]] = {}
+            progress_bar = st.progress(0, text="Starting…")
 
-    df_partial = pd.DataFrame(rows_partial).set_index("FM")
-
-    def _highlight_convergence(row: pd.Series) -> pd.Series:
-        conv = row["Converges at"]
-        return pd.Series(
-            {
-                col: (
-                    "background-color: #c6efce; font-weight: bold"
-                    if col == conv and col != "Converges at"
-                    else ""
+            for step_i, frac in enumerate(FRACTIONS):
+                n = prefix_sizes[frac]
+                steps_subset = selected_trace["steps"][:n]
+                trace_text_p = "\n".join(
+                    f"[Step {s.get('metadata', {}).get('step_index', i)}] "
+                    f"{s.get('agent', 'Unknown')}: {s.get('content', '')}"
+                    for i, s in enumerate(steps_subset)
                 )
-                for col in row.index
-            }
-        )
+                progress_bar.progress(
+                    step_i / len(FRACTIONS),
+                    text=f"Running {LABELS[frac]} prefix ({n}/{n_steps} steps)…",
+                )
+                config_p = JudgeConfig(
+                    name=f"partial_{frac}_{datetime.now().isoformat()}",
+                    model=model,
+                    backend=backend,
+                    temperature=0.0,
+                    definitions_path=str(defs_path_p),
+                    examples_path=str(examples_path_p),
+                )
+                judge_p = LLMJudge(config_p)
+                prompt_p = build_judge_prompt(trace_text_p, definitions_p, examples_p)
+                try:
+                    resp_p = judge_p._dispatch(prompt_p, f"trace_{selected_idx}_frac{frac}")
+                    verdicts_by_frac[frac] = parse_14_modes(resp_p.raw_text)
+                except Exception as e:
+                    st.error(f"Error at {LABELS[frac]}: {e}")
+                    verdicts_by_frac[frac] = {m: -1 for m in FAILURE_MODES}
 
-    st.dataframe(
-        df_partial.style.apply(_highlight_convergence, axis=1),
-        use_container_width=True,
-    )
+            progress_bar.progress(1.0, text="Done.")
+            progress_bar.empty()
 
-    # Convergence summary
-    conv_counts: dict[str, int] = {}
-    for row in rows_partial:
-        c = row["Converges at"]
-        conv_counts[c] = conv_counts.get(c, 0) + 1
+            # Build results table
+            ref = verdicts_by_frac.get(1.00, {})
+            rows_partial = []
+            present_modes = []
 
-    cols_summary = st.columns(len(FRACTIONS) + 1)
-    for col_ui, label in zip(cols_summary, list(LABELS.values()) + ["—"]):
-        col_ui.metric(label, f"{conv_counts.get(label, 0)} modes")
+            for mode in FAILURE_MODES:
+                full_verdict = ref.get(mode, -1)
+                row = {"FM": mode}
+
+                # Per-prefix verdict cells
+                prefix_verdicts = {}
+                for frac in FRACTIONS:
+                    v = verdicts_by_frac.get(frac, {}).get(mode, -1)
+                    prefix_verdicts[frac] = v
+                    row[LABELS[frac]] = "✅" if v == 1 else ("❌" if v == 0 else "?")
+
+                if full_verdict != 1:
+                    # Absent at full trace — convergence metrics not meaningful
+                    row["First detected"] = "n/a"
+                    row["Stable from"] = "n/a"
+                    row["Stable?"] = "absent"
+                else:
+                    present_modes.append(mode)
+
+                    # First detected: smallest prefix where verdict is YES
+                    first_det = None
+                    for frac in FRACTIONS:
+                        if prefix_verdicts[frac] == 1:
+                            first_det = LABELS[frac]
+                            break
+                    row["First detected"] = first_det or "100%"
+
+                    # Stable from: smallest prefix from which verdict stays YES through 100%
+                    stable_from = None
+                    for i, frac in enumerate(FRACTIONS):
+                        if all(prefix_verdicts[f] == 1 for f in FRACTIONS[i:]):
+                            stable_from = LABELS[frac]
+                            break
+                    row["Stable from"] = stable_from or "100%"
+
+                    row["Stable?"] = "stable" if row["First detected"] == row["Stable from"] else "unstable"
+
+                rows_partial.append(row)
+
+            # Render markdown table
+            header = "| FM | 25% | 50% | 75% | 100% | First detected | Stable from | Stable? |"
+            sep    = "|---|---|---|---|---|---|---|---|"
+            lines  = [header, sep]
+            for row in rows_partial:
+                stability = row["Stable?"]
+                stable_flag = "✓" if stability == "stable" else ("✗ unstable" if stability == "unstable" else "—")
+                lines.append(
+                    f"| {row['FM']} | {row['25%']} | {row['50%']} | {row['75%']} | {row['100%']}"
+                    f" | {row['First detected']} | {row['Stable from']} | {stable_flag} |"
+                )
+            st.markdown("\n".join(lines))
+
+            # Headline summary
+            n_present = len(present_modes)
+            present_rows = [r for r in rows_partial if r["Stable?"] != "absent"]
+            n_early = sum(1 for r in present_rows if r["First detected"] == "25%")
+            n_unstable = sum(1 for r in present_rows if r["Stable?"] == "unstable")
+
+            st.write(
+                f"**Present modes at 100 %:** {', '.join(present_modes) if present_modes else 'none'}. "
+                f"Of these, **{n_early}** first detected at 25 %, **{n_unstable}** unstable across prefixes."
+            )
+
+        except Exception as e:
+            st.error(f"Partial-trace error: {e}")
+            import traceback
+            st.code(traceback.format_exc())
 
 st.markdown("---")
 st.caption(
