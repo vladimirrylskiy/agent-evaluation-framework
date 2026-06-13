@@ -18,6 +18,7 @@ from google import genai
 from google.genai import types as genai_types
 import google.auth.impersonated_credentials
 import google.auth.transport.requests
+import google.oauth2.service_account
 from google.cloud import secretmanager
 from anthropic import AnthropicVertex
 import ollama
@@ -173,7 +174,7 @@ class GCPAuth:
         If the credentials are expired, returns 0.
         If the credentials are valid, returns the remaining lifetime in seconds.
         """
-        if self.creds is not None:
+        if self.creds is not None and self.creds.expiry is not None:
             now = datetime.datetime.now(datetime.timezone.utc).timestamp()
             expiration = self.creds.expiry.replace(
                 tzinfo=datetime.timezone.utc).timestamp()
@@ -213,7 +214,21 @@ class GCPAuth:
             target_scopes = [
                 "https://www.googleapis.com/auth/cloud-platform"
             ]
-            creds, pid = google.auth.default(scopes=target_scopes)
+            # On Streamlit Cloud, use the service account key stored in secrets.
+            _streamlit_creds_loaded = False
+            try:
+                import streamlit as st
+                if "gcp_service_account" in st.secrets:
+                    sa_info = dict(st.secrets["gcp_service_account"])
+                    creds = google.oauth2.service_account.Credentials.from_service_account_info(
+                        sa_info, scopes=target_scopes
+                    )
+                    print("Authenticated via Streamlit secrets (service account)")
+                    _streamlit_creds_loaded = True
+            except Exception as e:
+                print(f"Streamlit secrets auth failed: {e}")
+            if not _streamlit_creds_loaded:
+                creds, _ = google.auth.default(scopes=target_scopes)
             if self.impersonate_service_account is not None:
                 self.creds = google.auth.impersonated_credentials.Credentials(
                     source_credentials=creds,
