@@ -2,7 +2,7 @@
 Streamlit app for step-level failure mode localization in multi-agent traces.
 
 Stage 1: Load parsed traces and visualize step-level localization.
-Uses parsed JSON from parsers (ChatDev only for MVP).
+Uses parsed JSON from parsers (all 7 MAS frameworks).
 
 ⚠️ IMPORTANT: This is a qualitative proof-of-concept. There is NO step-level ground truth in MAD.
 All step-level predictions are compared only against the full-trace verdict as a baseline.
@@ -25,9 +25,21 @@ from LLM_models_interface.llm_interface import (
     build_judge_prompt,
     build_subordinate_localise_prompt,
     parse_localized_steps,
+    build_forced_batch_prompt, build_semi_forced_batch_prompt,
+    parse_batch_localise_response,
+    build_relaxed_localise_prompt, parse_relaxed_steps,
     LLMJudge,
     JudgeConfig,
     FAILURE_MODES,
+)
+from experiment_core import (
+    match_fm_description,
+    majority_vote,
+    build_ground_truth,
+    compute_convergence,
+    steps_to_text,
+    FRACTIONS,
+    FRAC_LABELS,
 )
 
 # ============================================================================
@@ -52,72 +64,45 @@ st.markdown("""
 # SIDEBAR: Load & Configure
 # ============================================================================
 
+if "active_panel" not in st.session_state:
+    st.session_state.active_panel = None
+
 with st.sidebar:
     st.header("Configuration")
     
-    # Parser selection (MVP: ChatDev only)
-    framework = st.selectbox(
-        "Select framework (MVP: ChatDev only)",
-        ["ChatDev"],
-        help="Stage 1 supports ChatDev. More frameworks coming in Stage 2."
-    )
-    
-    # Load parsed traces
-    parser_path = Path("parsers/chatdev_parser/chatdev_output_mad.json")
-    
+    # Framework selection
+    PARSER_PATHS = {
+        "ChatDev":     Path("parsers/chatdev_parser/chatdev_output_mad.json"),
+        "AG2":         Path("parsers/ag2_parser/ag2_output_mad.json"),
+        "AppWorld":    Path("parsers/appworld_parser/appworld_output_mad.json"),
+        "HyperAgent":  Path("parsers/hyperagent_parser/hyperagent_output_mad.json"),
+        "MetaGPT":     Path("parsers/metagpt_parser/metagpt_output_mad.json"),
+        "MagenticOne": Path("parsers/magenticone_parser/magenticone_output_mad.json"),
+        "OpenManus":   Path("parsers/openmanus_parser/openmanus_output_mad.json"),
+    }
+
+    framework = st.selectbox("Select framework", list(PARSER_PATHS.keys()))
+    parser_path = PARSER_PATHS[framework]
+
     if not parser_path.exists():
         st.error(f"Parser output not found: {parser_path}")
         st.stop()
-    
+
     with open(parser_path, "r", encoding="utf-8") as f:
         all_traces = json.load(f)
     
     st.info(f"Loaded {len(all_traces)} {framework} traces from parser output.")
     
     # Trace selector
-    # Load human-labeled dataset
-    human_path = Path("data/MAST-Data/MAD_human_labelled_dataset.json")
-    human_labels = {}
-    if human_path.exists():
-        with open(human_path, "r", encoding="utf-8") as f:
-            human_data = json.load(f)
-        # Build mapping: (mas_name, trace_id) -> {mode -> human_verdict}
-        for trace in human_data:
-            key = (str(trace.get('mas_name', '')), str(trace.get('trace_id', '')))
-            human_labels[key] = {}
-            for anno in trace.get('annotations', []):
-                mode_name = anno.get('failure mode', '')
-                # Extract mode code (e.g., "1.1" from "1.1 Poor task...")
-                mode_code = mode_name.split()[0] if mode_name else ''
-                if mode_code in FAILURE_MODES:
-                    # True if any annotator marked it
-                    verdict = (anno.get('annotator_1', False) or
-                              anno.get('annotator_2', False) or
-                              anno.get('annotator_3', False))
-                    human_labels[key][mode_code] = 1 if verdict else 0
-        st.info(f"Loaded {len(human_labels)} human-labeled traces for comparison.")
-    
     trace_options = []
     for i, t in enumerate(all_traces):
         trace_id = str(t['metadata'].get('trace_id', f'trace_{i}'))
-        mas_name = str(t['metadata'].get('mas_name', ''))
-        human_badge = " ✅" if (mas_name, trace_id) in human_labels else ""
-        trace_options.append(
-            f"{i}: {trace_id} ({len(t['steps'])} steps){human_badge}"
-        )
+        trace_options.append(f"{i}: {trace_id} ({len(t['steps'])} steps)")
 
     selected_idx = st.selectbox("Select a trace", range(len(all_traces)),
                                  format_func=lambda i: trace_options[i])
 
     selected_trace = all_traces[selected_idx]
-    selected_trace_id = str(selected_trace['metadata'].get('trace_id', ''))
-    selected_mas_name = str(selected_trace['metadata'].get('mas_name', ''))
-    has_human_label = (selected_mas_name, selected_trace_id) in human_labels
-
-    if has_human_label:
-        st.success("This trace has human labels.")
-    else:
-        st.warning("This trace does not have human labels.")
     
     # Model config for judge
     st.subheader("Judge Model Configuration")
@@ -136,10 +121,25 @@ with st.sidebar:
              "Naive: Single prompt tries to both detect and localize (over-detects)."
     )
     
-    run_judge = st.button("🔍 Run Judge (Full + Localized)", use_container_width=True)
+    if st.button("🔍 Run Judge (Full + Localized)", use_container_width=True):
+        st.session_state.active_panel = "judge"
     st.divider()
-    run_partial = st.button("📊 Run Partial-Trace Detection", use_container_width=True)
+    if st.button("📊 Run Partial-Trace Detection", use_container_width=True):
+        st.session_state.active_panel = "partial"
     st.caption("Runs the judge on 25 %, 50 %, 75 %, 100 % prefixes (3 extra calls). Uses the selected model.")
+    st.divider()
+    if st.button("🧑 Human-Label Validation", use_container_width=True):
+        st.session_state.active_panel = "human_val"
+    st.caption("Runs the judge on a trace from MAD_human_labelled_dataset.json and compares to its own annotations.")
+    st.divider()
+    if st.button("🧪 Framework Comparison", use_container_width=True):
+        st.session_state.active_panel = "framework_compare"
+    st.caption("Compare FORCED / SEMI-FORCED / RELAXED subordinate localizers on the selected trace.")
+
+run_judge = st.session_state.active_panel == "judge"
+run_partial = st.session_state.active_panel == "partial"
+run_human_val = st.session_state.active_panel == "human_val"
+run_framework_compare = st.session_state.active_panel == "framework_compare"
 
 # ============================================================================
 # MAIN: Display Trace & Results
@@ -166,7 +166,7 @@ with col1:
 with col2:
     st.subheader("🎯 Judge Results")
     
-    if not run_judge and not run_partial:
+    if not run_judge and not run_partial and not run_human_val and not run_framework_compare:
         st.info("Configure and click a button in the sidebar to see results.")
     elif run_judge:
         with st.spinner("Running judge (this may take a moment)..."):
@@ -181,12 +181,7 @@ with col2:
                 # ====== FULL-TRACE JUDGE ======
                 st.write("#### 1️⃣ Full-Trace Verdict (Baseline)")
                 
-                # Build concatenated trace text
-                trace_text = "\n".join([
-                    f"[Step {s.get('metadata', {}).get('step_index', i)}] "
-                    f"{s.get('agent', 'Unknown')}: {s.get('content', '')}"
-                    for i, s in enumerate(selected_trace['steps'])
-                ])
+                trace_text = steps_to_text(selected_trace['steps'])
                 
                 prompt_full = build_judge_prompt(trace_text, definitions, examples)
                 
@@ -309,76 +304,6 @@ with col2:
                     f"{matches}/{total} modes ({100*matches//total}%)"
                 )
 
-                # ====== HUMAN LABEL COMPARISON ======
-                if has_human_label:
-                    st.write("---")
-                    st.write("#### 👥 Human-Labeled Comparison")
-                    st.caption("Comparing judges against human annotations (majority vote of 3 annotators).")
-
-                    human_anno = human_labels[(selected_mas_name, selected_trace_id)]
-
-                    comparison_data = []
-                    full_agree_human = 0
-                    local_agree_human = 0
-
-                    for mode in FAILURE_MODES:
-                        human_verdict = human_anno.get(mode, -1)
-                        full_verdict = annotations_full[mode]
-                        local_verdict = annotations_localise[mode]['present']
-
-                        if human_verdict == -1:
-                            human_str = "?"
-                        else:
-                            human_str = "✅" if human_verdict == 1 else "❌"
-
-                        full_match = "✓" if full_verdict == human_verdict else "✗"
-                        local_match = "✓" if local_verdict == human_verdict else "✗"
-
-                        if full_verdict == human_verdict and human_verdict != -1:
-                            full_agree_human += 1
-                        if local_verdict == human_verdict and human_verdict != -1:
-                            local_agree_human += 1
-
-                        full_str = "✅" if full_verdict == 1 else "❌"
-                        local_str = "✅" if local_verdict == 1 else "❌"
-
-                        comparison_data.append({
-                            "Mode": mode,
-                            "Human": human_str,
-                            "Full-Trace": full_str,
-                            "Match": full_match,
-                            "Step-Local": local_str,
-                            "Match ": local_match
-                        })
-
-                    # Render a cleaner, aligned comparison using Streamlit columns
-                    header_cols = st.columns([1, 1, 1, 1, 1, 1])
-                    headers = ["Mode", "Human", "Full-Trace", "Match", "Step-Local", "Match"]
-                    for c, h in zip(header_cols, headers):
-                        c.markdown(f"**{h}**")
-
-                    for row in comparison_data:
-                        c0, c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1, 1])
-                        c0.write(row['Mode'])
-                        c1.write(row['Human'])
-                        c2.write(row['Full-Trace'])
-                        c3.write(row['Match'])
-                        c4.write(row['Step-Local'])
-                        c5.write(row['Match '])
-
-                    col_h1, col_h2 = st.columns(2)
-                    with col_h1:
-                        st.metric(
-                            "Full-Trace vs Human",
-                            f"{full_agree_human}/{len(FAILURE_MODES)} modes ({100*full_agree_human//len(FAILURE_MODES)}%)"
-                        )
-                    with col_h2:
-                        st.metric(
-                            "Step-Level vs Human",
-                            f"{local_agree_human}/{len(FAILURE_MODES)} modes ({100*local_agree_human//len(FAILURE_MODES)}%)"
-                        )
-                else:
-                    st.info("⚠️ No human label available for this trace.")
                 # ====== RAW RESPONSES (Debug) ======
                 with st.expander("🔧 Debug: Raw LLM Responses"):
                     st.subheader("Full-Trace Response")
@@ -419,9 +344,7 @@ with col2:
             "the smallest prefix at which the verdict converges to — and stays at — the full-trace verdict."
         )
         try:
-            FRACTIONS = [0.25, 0.50, 0.75, 1.00]
-            LABELS = {0.25: "25%", 0.50: "50%", 0.75: "75%", 1.00: "100%"}
-
+            LABELS = FRAC_LABELS
             n_steps = len(selected_trace["steps"])
             prefix_sizes = {frac: max(1, round(n_steps * frac)) for frac in FRACTIONS}
             st.caption(
@@ -440,11 +363,7 @@ with col2:
             for step_i, frac in enumerate(FRACTIONS):
                 n = prefix_sizes[frac]
                 steps_subset = selected_trace["steps"][:n]
-                trace_text_p = "\n".join(
-                    f"[Step {s.get('metadata', {}).get('step_index', i)}] "
-                    f"{s.get('agent', 'Unknown')}: {s.get('content', '')}"
-                    for i, s in enumerate(steps_subset)
-                )
+                trace_text_p = steps_to_text(steps_subset)
                 progress_bar.progress(
                     step_i / len(FRACTIONS),
                     text=f"Running {LABELS[frac]} prefix ({n}/{n_steps} steps)…",
@@ -475,41 +394,21 @@ with col2:
             present_modes = []
 
             for mode in FAILURE_MODES:
-                full_verdict = ref.get(mode, -1)
+                conv = compute_convergence(mode, verdicts_by_frac)
                 row = {"FM": mode}
-
-                # Per-prefix verdict cells
-                prefix_verdicts = {}
                 for frac in FRACTIONS:
                     v = verdicts_by_frac.get(frac, {}).get(mode, -1)
-                    prefix_verdicts[frac] = v
                     row[LABELS[frac]] = "✅" if v == 1 else ("❌" if v == 0 else "?")
 
-                if full_verdict != 1:
-                    # Absent at full trace — convergence metrics not meaningful
+                if conv["full_verdict"] != 1:
                     row["First detected"] = "n/a"
                     row["Stable from"] = "n/a"
                     row["Stable?"] = "absent"
                 else:
                     present_modes.append(mode)
-
-                    # First detected: smallest prefix where verdict is YES
-                    first_det = None
-                    for frac in FRACTIONS:
-                        if prefix_verdicts[frac] == 1:
-                            first_det = LABELS[frac]
-                            break
-                    row["First detected"] = first_det or "100%"
-
-                    # Stable from: smallest prefix from which verdict stays YES through 100%
-                    stable_from = None
-                    for i, frac in enumerate(FRACTIONS):
-                        if all(prefix_verdicts[f] == 1 for f in FRACTIONS[i:]):
-                            stable_from = LABELS[frac]
-                            break
-                    row["Stable from"] = stable_from or "100%"
-
-                    row["Stable?"] = "stable" if row["First detected"] == row["Stable from"] else "unstable"
+                    row["First detected"] = conv["first_detected"]
+                    row["Stable from"] = conv["stable_from"]
+                    row["Stable?"] = "stable" if conv["stable"] else "unstable"
 
                 rows_partial.append(row)
 
@@ -541,6 +440,258 @@ with col2:
             st.error(f"Partial-trace error: {e}")
             import traceback
             st.code(traceback.format_exc())
+
+    if run_human_val:
+        st.markdown("---")
+        st.subheader("🧑 Human-Label Validation")
+        st.caption(
+            "Loads traces directly from MAD_human_labelled_dataset.json. "
+            "Runs the judge on each trace's own text and compares to that record's human annotations "
+            "(majority vote of 3 annotators). Same record — valid comparison."
+        )
+        try:
+            human_path_v = Path("data/MAST-Data/MAD_human_labelled_dataset.json")
+            if not human_path_v.exists():
+                st.error("MAD_human_labelled_dataset.json not found.")
+                st.stop()
+
+            with open(human_path_v) as f:
+                human_records = json.load(f)
+
+            human_options = [
+                f"{i}: {r['mas_name']} trace_id={r['trace_id']} ({r.get('benchmark_name','')})"
+                for i, r in enumerate(human_records)
+            ]
+            selected_human_idx = st.selectbox(
+                "Select human-labelled trace", range(len(human_records)),
+                format_func=lambda i: human_options[i],
+                key="human_val_selector"
+            )
+            record = human_records[selected_human_idx]
+
+            ground_truth = build_ground_truth(record)
+
+            st.write(f"**MAS:** {record['mas_name']} | **Benchmark:** {record.get('benchmark_name','')} | **trace_id:** {record['trace_id']}")
+            st.write(f"**Human ground truth (majority vote):** {sum(ground_truth.values())} modes present out of {len(ground_truth)}")
+
+            if st.button("▶ Run judge on this trace", key="run_human_judge"):
+                defs_path_h = Path("data/prompts/definitions.txt")
+                examples_path_h = Path("data/prompts/examples.txt")
+                definitions_h = defs_path_h.read_text() if defs_path_h.exists() else ""
+                examples_h = examples_path_h.read_text() if examples_path_h.exists() else ""
+
+                trace_text_h = record.get('trace', '')
+                prompt_h = build_judge_prompt(trace_text_h, definitions_h, examples_h)
+
+                config_h = JudgeConfig(
+                    name=f"human_val_{record['mas_name']}_{record['trace_id']}",
+                    model=model,
+                    backend=backend,
+                    temperature=0.0,
+                    definitions_path=str(defs_path_h),
+                    examples_path=str(examples_path_h),
+                )
+                judge_h = LLMJudge(config_h)
+
+                with st.spinner("Running judge on human-labelled trace…"):
+                    try:
+                        resp_h = judge_h._dispatch(prompt_h, f"human_{record['trace_id']}")
+                        pred_h = parse_14_modes(resp_h.raw_text)
+                    except Exception as e:
+                        st.error(f"Judge error: {e}")
+                        import traceback; st.code(traceback.format_exc())
+                        st.stop()
+
+                agree, total = 0, 0
+                lines_h = ["| FM | Human (majority) | Judge | Match |", "|---|---|---|---|"]
+                for mode in FAILURE_MODES:
+                    human_v = ground_truth.get(mode, -1)
+                    judge_v = pred_h.get(mode, -1)
+                    if human_v == -1:
+                        h_str, j_str, match = "?", "?", "—"
+                    else:
+                        h_str = "✅" if human_v == 1 else "❌"
+                        j_str = "✅" if judge_v == 1 else "❌"
+                        match = "✓" if human_v == judge_v else "✗"
+                        agree += 1 if human_v == judge_v else 0
+                        total += 1
+                    lines_h.append(f"| {mode} | {h_str} | {j_str} | {match} |")
+                st.markdown("\n".join(lines_h))
+                pct = 100 * agree // total if total else 0
+                st.metric("Agreement (judge vs human majority)", f"{agree}/{total} modes ({pct}%)")
+
+        except Exception as e:
+            st.error(f"Human validation error: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+
+    if run_framework_compare:
+        st.markdown("---")
+        st.subheader("🧪 Framework Comparison: Subordinate Localizers")
+        st.caption(
+            "**4 LLM calls total per trace.** "
+            "Shared judge call detects present modes → "
+            "**Forced** batch (1 call, all detected modes, must commit to steps) → "
+            "**Semi-Forced** batch (1 call, all detected modes, may output `NO_STEP_FOUND`) → "
+            "**Relaxed** (1 call, full FM taxonomy, no judge signal, detect + locate simultaneously)."
+        )
+
+        steps = selected_trace["steps"]
+        n_steps = len(steps)
+        defs_path_fw = Path("data/prompts/definitions.txt")
+        definitions_fw = defs_path_fw.read_text() if defs_path_fw.exists() else ""
+
+        def _resolve_mode_name(code):
+            m = re.search(rf"{re.escape(code)}\s+([^\n:]+)", definitions_fw)
+            return m.group(1).strip() if m else f"Mode {code}"
+
+        def _make_judge_fw():
+            return LLMJudge(JudgeConfig(
+                name=f"fw_{datetime.now().isoformat()}",
+                model=model, backend=backend, temperature=0.0,
+                definitions_path=str(defs_path_fw), examples_path="",
+            ))
+
+        if st.button("▶ Run all 3 frameworks on this trace",
+                     key="run_fw_all", use_container_width=True):
+            judge_fw = _make_judge_fw()
+            trace_text = steps_to_text(steps)
+            raw_responses: dict = {}
+            bar = st.progress(0.0, text="Starting…")
+
+            # ── Call 1: Shared judge (Forced + Semi-Forced) ───────────────────
+            bar.progress(0.05, text="Call 1/4 — Judge: detecting present modes…")
+            try:
+                p_judge = build_judge_prompt(trace_text, definitions_fw, "")
+                r_judge = judge_fw._dispatch(p_judge, "fw_judge")
+                judge_verdicts = parse_14_modes(r_judge.raw_text)
+                raw_responses["judge"] = {"raw": r_judge.raw_text, "error": None}
+            except Exception as e:
+                judge_verdicts = {m: 0 for m in FAILURE_MODES}
+                raw_responses["judge"] = {"raw": "", "error": str(e)}
+
+            present_modes = [m for m in FAILURE_MODES if judge_verdicts.get(m, 0) == 1]
+
+            # ── Call 2: Forced batch ──────────────────────────────────────────
+            bar.progress(0.30, text=f"Call 2/4 — Forced: localizing {len(present_modes)} mode(s)…")
+            forced_res: dict = {}
+            if present_modes:
+                try:
+                    p = build_forced_batch_prompt(present_modes, steps, definitions_fw)
+                    r = judge_fw._dispatch(p, "forced_batch")
+                    forced_res = parse_batch_localise_response(r.raw_text, n_steps)
+                    raw_responses["forced"] = {"raw": r.raw_text, "error": None}
+                except Exception as e:
+                    raw_responses["forced"] = {"raw": "", "error": str(e)}
+            else:
+                raw_responses["forced"] = {"raw": "(no modes to localize)", "error": None}
+
+            # ── Call 3: Semi-Forced batch ─────────────────────────────────────
+            bar.progress(0.55, text=f"Call 3/4 — Semi-Forced: localizing {len(present_modes)} mode(s)…")
+            semi_res: dict = {}
+            if present_modes:
+                try:
+                    p = build_semi_forced_batch_prompt(present_modes, steps, definitions_fw)
+                    r = judge_fw._dispatch(p, "semi_batch")
+                    semi_res = parse_batch_localise_response(r.raw_text, n_steps)
+                    raw_responses["semi"] = {"raw": r.raw_text, "error": None}
+                except Exception as e:
+                    raw_responses["semi"] = {"raw": "", "error": str(e)}
+            else:
+                raw_responses["semi"] = {"raw": "(no modes to localize)", "error": None}
+
+            # ── Call 4: Relaxed — no judge pre-run ───────────────────────────
+            bar.progress(0.80, text="Call 4/4 — Relaxed: detect + locate with full taxonomy…")
+            try:
+                p_relaxed = build_relaxed_localise_prompt(steps, definitions_fw)
+                r_relaxed = judge_fw._dispatch(p_relaxed, "relaxed_full")
+                relaxed_parsed = parse_relaxed_steps(r_relaxed.raw_text, n_steps)
+                raw_responses["relaxed"] = {"raw": r_relaxed.raw_text, "error": None}
+            except Exception as e:
+                relaxed_parsed = {}
+                raw_responses["relaxed"] = {"raw": "", "error": str(e)}
+
+            bar.progress(1.0, text="Done — 4 calls complete.")
+            bar.empty()
+            st.session_state.fw_table = {
+                "judge_verdicts": judge_verdicts,
+                "forced": forced_res,
+                "semi": semi_res,
+                "relaxed_parsed": relaxed_parsed,
+                "raw": raw_responses,
+            }
+
+        if "fw_table" in st.session_state:
+            import pandas as pd
+            fw = st.session_state.fw_table
+            judge_verdicts = fw.get("judge_verdicts", {})
+            forced_res     = fw["forced"]
+            semi_res       = fw["semi"]
+            relaxed_parsed = fw.get("relaxed_parsed", {})
+
+            def _fmt_forced(mode):
+                if not judge_verdicts.get(mode, 0):
+                    return "—"
+                v = forced_res.get(mode)
+                if v is None:                    return "✓ (no parse)"
+                if v["steps"] == "global":       return "GLOBAL"
+                if v["steps"]:                   return "Steps " + ", ".join(str(s) for s in v["steps"])
+                return "✓ (no parse)"
+
+            def _fmt_semi(mode):
+                if not judge_verdicts.get(mode, 0):
+                    return "—"
+                v = semi_res.get(mode)
+                if v is None:                    return "✓ (no parse)"
+                if v["retracted"]:               return "✗ retracted"
+                if v["steps"] == "global":       return "GLOBAL"
+                if v["steps"]:                   return "Steps " + ", ".join(str(s) for s in v["steps"])
+                return "✓ (no parse)"
+
+            def _fmt_relaxed(mode):
+                hits = sorted(
+                    [k for k, v in relaxed_parsed.items() if mode in v],
+                    key=lambda k: -1 if k == "global" else int(k),
+                )
+                if not hits: return "—"
+                return ", ".join("GLOBAL" if k == "global" else f"Step {k}" for k in hits)
+
+            rows = []
+            for mode in FAILURE_MODES:
+                mname = _resolve_mode_name(mode)
+                rows.append({
+                    "FM": f"{mode}  {mname}",
+                    "🔒 Forced":      _fmt_forced(mode),
+                    "⚖️ Semi-Forced": _fmt_semi(mode),
+                    "🔓 Relaxed":     _fmt_relaxed(mode),
+                })
+
+            df = pd.DataFrame(rows).set_index("FM")
+            st.dataframe(df, use_container_width=True)
+
+            present = [m for m in FAILURE_MODES if judge_verdicts.get(m, 0)]
+            st.caption(
+                f"Judge detected **{len(present)}** mode(s) present: "
+                + (", ".join(present) if present else "none")
+            )
+
+            raw = fw.get("raw", {})
+            with st.expander("🔧 Raw Judge response"):
+                if raw.get("judge", {}).get("error"):
+                    st.warning(raw["judge"]["error"])
+                st.code(raw.get("judge", {}).get("raw", ""), language="text")
+            with st.expander("🔧 Raw Forced response"):
+                if raw.get("forced", {}).get("error"):
+                    st.warning(raw["forced"]["error"])
+                st.code(raw.get("forced", {}).get("raw", ""), language="text")
+            with st.expander("🔧 Raw Semi-Forced response"):
+                if raw.get("semi", {}).get("error"):
+                    st.warning(raw["semi"]["error"])
+                st.code(raw.get("semi", {}).get("raw", ""), language="text")
+            with st.expander("🔧 Raw Relaxed response"):
+                if raw.get("relaxed", {}).get("error"):
+                    st.warning(raw["relaxed"]["error"])
+                st.code(raw.get("relaxed", {}).get("raw", ""), language="text")
 
 st.markdown("---")
 st.caption(

@@ -101,33 +101,8 @@ Note that the `_add_prefix_for_feature_names_out` method is not explicitly shown
 
 3.1 Premature Termination: Ending a dialogue, interaction or task before all necessary information has been exchanged or objectives have been met. Necessary information constitutes verification of outputs, key data (e.g. api tokens) etc. that are necessary for the success of the task, and agents could have obtained if they tried more or already obtained but failed to communicate to other agents before termination.
 
-3.2 Weak Verification: 
-Weak verification refers to situations where verification mechanisms (agent or step) exist within the system but fail to comprehensively cover all essential aspects of the design necessary for generating robust and reliable outputs. While verification steps are present, they may be incomplete, superficial, or insufficiently rigorous, thereby overlooking critical system attributes or interactions.
+3.2 No or Incomplete Verification:
+(Partial) omission of proper checking or confirmation of task outcomes or system outputs, potentially allowing errors or inconsistencies to propagate undetected.
 
-Consequences of weak verification include partial validation that allows subtle errors, inconsistencies, or vulnerabilities to remain undetected, potentially compromising overall system reliability and effectiveness. This inadequacy can result in suboptimal system performance, unforeseen failures, cascade to final output if occur during substeps.
-
-"You are a Code Reviewer. We are both working at ChatDev. We share a common interest in collaborating to successfully complete a task assigned by a new customer. You can help programmers assess source code for software troubleshooting, fix bugs to enhance code quality and robustness, and propose improvements to the source code. Here is a new customer's task: {task}. To complete the task, you must write a response that appropriately solves the requested instruction based on your expertise and the customer's needs."
-
-However, when asked to review generated code for a Sudoku game, the reviewer failed to recognize that standard Sudoku puzzles typically come pre-filled with numbers for the player to solve, an element absent in the generated implementation. Numerous Sudoku implementations and specifications are readily available online, which the verification agent could easily consult to ensure robustness and completeness.
-
-Another example occurred with a TicTacToe implementation. While the game was functional and playable, the system incorrectly announced the winning player at the game's conclusion, despite employing the same ChatDev code reviewer prompt.
-
-3.3 No or Incorrect Verification:
-Omission of proper checking or confirmation of task outcomes or system outputs, potentially allowing errors or inconsistencies to propagate undetected. So, either no verification or verification is designed to exist in MAS, but verifier fail to complete what was exactly prompted to do. Eg: make sure the code compiles, but the code doesn't even compile.
-Verification is particularly critical in cases where tasks or outputs are readily verifiable by the system itself without human intervention.
-
-Consequences of inadequate or absent verification include the propagation of undetected errors, system inconsistencies, reduced reliability, and failure in the generated output.
-
-A few examples are as follows:
-1. In ChatDev, when prompted by a user to generate a game (e.g., "textBasedSpaceInvaders"), verification steps failed despite multiple review stages. Although the code was reportedly verified, compilation errors persisted, leading to runtime failures:
-yes Error: The file 'ship.bmp' was not found in the directory /Users/user/Documents/*/ChatDev/WareHouse/TextBasedSpaceInvaders_DefaultOrganization_20250117121911.
-Traceback (most recent call last):
-  File "/Users/user/Documents/*/ChatDev/WareHouse/TextBasedSpaceInvaders_DefaultOrganization_20250117121911/main.py", line 31, in <module>
-    run_game()
-  File "/Users/user/Documents/*/ChatDev/WareHouse/TextBasedSpaceInvaders_DefaultOrganization_20250117121911/main.py", line 22, in run_game
-    gf.create_fleet(ai_settings, screen, aliens)
-  File "/Users/user/Documents/*/ChatDev/WareHouse/TextBasedSpaceInvaders_DefaultOrganization_20250117121911/game_functions.py", line 64, in create_fleet
-    alien = Alien(ai_settings, screen)
-  File "/Users/user/Documents/*/ChatDev/WareHouse/TextBasedSpaceInvaders_DefaultOrganization_20250117121911/alien.py", line 13, in __init__
-    self.image = pygame.image.load('alien.bmp')
-FileNotFoundError: No file 'alien.bmp' found in working directory '/Users/*/Documents/*/ChatDev'.
+3.3 Incorrect Verification:
+Failure to adequately validate or cross-check crucial information or decisions during the iterations, potentially leading to errors or vulnerabilities in the system.

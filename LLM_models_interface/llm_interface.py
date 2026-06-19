@@ -124,8 +124,8 @@ def build_judge_prompt(trace: str, definitions: str, examples: str=''):
     "2.5 Ignored Other Agent's Input: <yes or no>"
     "2.6 Action-Reasoning Mismatch: <yes or no>"
     "3.1 Premature Termination: <yes or no>"
-    "3.2 No or Incorrect Verification: <yes or no>"
-    "3.3 Weak Verification: <yes or no>"
+    "3.2 No or Incomplete Verification: <yes or no>"
+    "3.3 Incorrect Verification: <yes or no>"
     "@@*** end of your answer ***"
     "An example answer is: \n"
     "A. The task is not completed due to disobeying role specification as agents went rogue and started to chat with each other instead of completing the task. Agents derailed and verifier is not strong enough to detect it.\n"
@@ -476,8 +476,8 @@ def build_localise_prompt(steps: list[dict], definitions: str, examples: str = '
         "2.5 Ignored Other Agent's Input: <yes or no>; steps: <step_index(s) or 'global' or 'n/a'>\n"
         "2.6 Action-Reasoning Mismatch: <yes or no>; steps: <step_index(s) or 'global' or 'n/a'>\n"
         "3.1 Premature Termination: <yes or no>; steps: <'global' or 'n/a'>\n"
-        "3.2 No or Incorrect Verification: <yes or no>; steps: <step_index(s) or 'global' or 'n/a'>\n"
-        "3.3 Weak Verification: <yes or no>; steps: <step_index(s) or 'global' or 'n/a'>\n"
+        "3.2 No or Incomplete Verification: <yes or no>; steps: <step_index(s) or 'global' or 'n/a'>\n"
+        "3.3 Incorrect Verification: <yes or no>; steps: <step_index(s) or 'global' or 'n/a'>\n"
         "@@\n\n"
         "Here are the failure mode definitions:\n"
         f"{definitions}\n\n"
@@ -615,6 +615,673 @@ def parse_localized_steps(response: str) -> list | str:
     
     # If no steps found, return empty list
     return []
+
+
+# ── Subordinate localizer frameworks ─────────────────────────────────────────
+#
+# Three prompt configurations for the Subordinated Step Localisation experiment,
+# testing different levels of constraint on the model.
+#
+#   FORCED      — model must output a step coordinate; no escape route.
+#   SEMI-FORCED — model can retract the baseline flag via NO_STEP_FOUND.
+#   RELAXED     — model sees no baseline signal; evaluates all steps blindly.
+#
+# All three share _format_steps() and _extract_mode_definition().
+# ─────────────────────────────────────────────────────────────────────────────
+
+GLOBAL_MODES = {"1.1", "1.5", "3.1"}
+
+_FAILURE_MODES_NAMED = [
+    "1.1 Disobey Task Specification",
+    "1.2 Disobey Role Specification",
+    "1.3 Step Repetition",
+    "1.4 Loss of Conversation History",
+    "1.5 Unaware of Termination Conditions",
+    "2.1 Conversation Reset",
+    "2.2 Fail to Ask for Clarification",
+    "2.3 Task Derailment",
+    "2.4 Information Withholding",
+    "2.5 Ignored Other Agent's Input",
+    "2.6 Action-Reasoning Mismatch",
+    "3.1 Premature Termination",
+    "3.2 No or Incomplete Verification",
+    "3.3 Incorrect Verification",
+]
+
+
+def _format_steps(steps: list[dict]) -> str:
+    parts = []
+    for step in steps:
+        idx = step.get("metadata", {}).get("step_index", 0)
+        agent = step.get("agent", "Unknown")
+        content = step.get("content", "")
+        parts.append(f"[Step {idx}] {agent}:\n{content}")
+    return "\n\n".join(parts) + "\n"
+
+
+def _extract_mode_definition(mode_code: str, definitions: str) -> str:
+    """Return the first paragraph of a mode's definition from definitions.txt."""
+    pattern = rf"{re.escape(mode_code)}\s+[^\n]+:\n(.+?)(?=\n\d+\.\d+|\Z)"
+    match = re.search(pattern, definitions, re.DOTALL)
+    if match:
+        return match.group(1).strip()[:400]
+    return ""
+
+
+# ── 1. FORCED framework ───────────────────────────────────────────────────────
+
+def build_forced_localise_prompt(
+    mode_code: str,
+    mode_name: str,
+    steps: list[dict],
+    definitions: str,
+) -> str:
+    """
+    FORCED subordinate localizer.
+
+    The baseline verdict is presented as definitive. The model has no escape
+    hatch — it must output a step coordinate or GLOBAL. No conversational output
+    is permitted by the output rules.
+
+    Returns a single user-turn prompt string (no system/user split needed;
+    caller wraps in whatever message schema the judge uses).
+    """
+    if mode_code in GLOBAL_MODES:
+        return (
+            f"Failure mode {mode_code} {mode_name} is a global trace property "
+            f"and cannot be localised to individual steps.\n\n"
+            f"Output exactly one token: GLOBAL"
+        )
+
+    defn = _extract_mode_definition(mode_code, definitions)
+    steps_text = _format_steps(steps)
+
+    return (
+        f"FORENSIC TRACE ANALYSIS — STEP LOCALISATION\n\n"
+        f"A full-trace evaluation has definitively confirmed that failure mode "
+        f"**{mode_code} {mode_name}** is present in the trace below.\n\n"
+        f"Definition:\n{defn}\n\n"
+        f"Your only task is to identify the exact step(s) where this failure "
+        f"mode manifests. Do not question whether the mode is present. It is.\n\n"
+        f"TRACE:\n{steps_text}\n"
+        f"OUTPUT RULES — output nothing except one of these exact forms:\n"
+        f"  Step X          — single step\n"
+        f"  Steps X, Y, Z   — multiple non-contiguous steps\n"
+        f"  Steps X-Y       — contiguous range\n"
+        f"  GLOBAL          — mode is a property of the whole trace\n"
+        f"No explanation. No preamble. No trailing text.\n\n"
+        f"Step coordinate:"
+    )
+
+
+def parse_forced_steps(response: str, n_steps: int) -> list[int] | str:
+    """
+    Parse FORCED localizer output.
+
+    Returns:
+        'global'   — mode is trace-level
+        list[int]  — validated step indices (empty list if nothing parseable)
+    """
+    text = response.strip()
+
+    if re.search(r"\bGLOBAL\b", text, re.IGNORECASE):
+        return "global"
+
+    # "Steps X-Y" range form
+    range_match = re.search(r"[Ss]teps?\s+(\d+)\s*[-–]\s*(\d+)", text)
+    if range_match:
+        lo, hi = int(range_match.group(1)), int(range_match.group(2))
+        return sorted(s for s in range(lo, hi + 1) if 0 <= s < n_steps)
+
+    # "Step X" / "Steps X, Y, Z" — collect all digits
+    nums = [int(n) for n in re.findall(r"\d+", text)]
+    valid = sorted({n for n in nums if 0 <= n < n_steps})
+    return valid  # empty list signals unparseable
+
+
+# ── 2. SEMI-FORCED framework ──────────────────────────────────────────────────
+
+def build_semi_forced_localise_prompt(
+    mode_code: str,
+    mode_name: str,
+    steps: list[dict],
+    definitions: str,
+) -> str:
+    """
+    SEMI-FORCED subordinate localizer.
+
+    The baseline flag is presented as an initial hypothesis, not a verdict.
+    The model may confirm + locate, or retract via the sentinel NO_STEP_FOUND
+    if step-level inspection does not support the flag.
+
+    Returns a single user-turn prompt string.
+    """
+    if mode_code in GLOBAL_MODES:
+        return (
+            f"The baseline analysis flagged failure mode {mode_code} {mode_name} "
+            f"as likely present. This mode is a global trace property.\n\n"
+            f"Inspect the trace and output one of:\n"
+            f"  GLOBAL          — confirmed present across the trace\n"
+            f"  NO_STEP_FOUND   — baseline flag was incorrect; mode not present\n\n"
+            f"No other text."
+        )
+
+    defn = _extract_mode_definition(mode_code, definitions)
+    steps_text = _format_steps(steps)
+
+    return (
+        f"STEP-LEVEL VERIFICATION — FAILURE MODE LOCALISATION\n\n"
+        f"A full-trace baseline analysis flagged failure mode "
+        f"**{mode_code} {mode_name}** as likely present.\n\n"
+        f"Definition:\n{defn}\n\n"
+        f"Perform a careful step-by-step inspection. You have two options:\n"
+        f"  A) If the mode IS present: output the exact step(s) where it occurs.\n"
+        f"  B) If step-level evidence does NOT support the flag: output NO_STEP_FOUND.\n\n"
+        f"TRACE:\n{steps_text}\n"
+        f"OUTPUT RULES — output nothing except one of these exact forms:\n"
+        f"  Step X          — confirmed at a single step\n"
+        f"  Steps X, Y, Z   — confirmed at multiple steps\n"
+        f"  Steps X-Y       — confirmed across a contiguous range\n"
+        f"  GLOBAL          — confirmed as a whole-trace property\n"
+        f"  NO_STEP_FOUND   — baseline flag retracted after step inspection\n"
+        f"No explanation. No preamble. No trailing text.\n\n"
+        f"Verdict:"
+    )
+
+
+def parse_semi_forced_steps(
+    response: str, n_steps: int
+) -> list[int] | str | None:
+    """
+    Parse SEMI-FORCED localizer output.
+
+    Returns:
+        None       — model retracted the baseline (NO_STEP_FOUND)
+        'global'   — confirmed, trace-level
+        list[int]  — confirmed, specific step indices (empty = unparseable)
+    """
+    text = response.strip()
+
+    if re.search(r"NO_STEP_FOUND", text, re.IGNORECASE):
+        return None  # explicit retraction
+
+    if re.search(r"\bGLOBAL\b", text, re.IGNORECASE):
+        return "global"
+
+    range_match = re.search(r"[Ss]teps?\s+(\d+)\s*[-–]\s*(\d+)", text)
+    if range_match:
+        lo, hi = int(range_match.group(1)), int(range_match.group(2))
+        return sorted(s for s in range(lo, hi + 1) if 0 <= s < n_steps)
+
+    nums = [int(n) for n in re.findall(r"\d+", text)]
+    return sorted({n for n in nums if 0 <= n < n_steps})
+
+
+# ── 3. RELAXED framework ──────────────────────────────────────────────────────
+
+def build_relaxed_localise_prompt(
+    steps: list[dict],
+    definitions: str,
+) -> str:
+    """
+    RELAXED (blind) subordinate localizer.
+
+    No baseline signal. The model evaluates every step independently against
+    all 14 MAST failure modes and flags any it detects. This is a bottom-up
+    scan with no prior hypothesis.
+
+    Returns a single user-turn prompt string.
+    """
+    steps_text = _format_steps(steps)
+    modes_list = "\n".join(f"  {m}" for m in _FAILURE_MODES_NAMED)
+
+    return (
+        f"STEP-LEVEL FAILURE MODE ANALYSIS\n\n"
+        f"Below is a multi-agent system trace with numbered steps. "
+        f"Evaluate each step independently against all 14 MAST failure modes.\n\n"
+        f"FAILURE MODES:\n{modes_list}\n\n"
+        f"DEFINITIONS:\n{definitions}\n\n"
+        f"TRACE:\n{steps_text}\n"
+        f"OUTPUT RULES:\n"
+        f"  • For each step where you detect one or more failure modes, output:\n"
+        f"      Step X: 1.1, 2.3\n"
+        f"  • For global-property modes (1.1, 1.5, 3.1) that apply to the whole\n"
+        f"    trace rather than a single step, output:\n"
+        f"      GLOBAL: 1.1\n"
+        f"  • Omit clean steps entirely.\n"
+        f"  • No explanations. No preamble. Only the flagged-step lines.\n\n"
+        f"Flagged steps:"
+    )
+
+
+def parse_relaxed_steps(
+    response: str, n_steps: int
+) -> dict[str, list[str]]:
+    """
+    Parse RELAXED localizer output.
+
+    Returns a dict mapping step key → list of mode codes detected there.
+      Key is a stringified step index ('0', '3', …) or 'global'.
+
+    Example: {'3': ['1.3', '2.6'], '7': ['3.2'], 'global': ['1.1']}
+    Empty dict if the model found no failure modes.
+    """
+    result: dict[str, list[str]] = {}
+
+    for line in response.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        # "GLOBAL: 1.1, 3.1"
+        global_match = re.match(r"GLOBAL\s*[:\-]\s*(.*)", line, re.IGNORECASE)
+        if global_match:
+            codes = re.findall(r"\b\d+\.\d+\b", global_match.group(1))
+            valid = [c for c in codes if c in FAILURE_MODES]
+            if valid:
+                result.setdefault("global", []).extend(valid)
+            continue
+
+        # "Step X: 1.1, 2.3"
+        step_match = re.match(r"[Ss]tep\s+(\d+)\s*[:\-]\s*(.*)", line)
+        if step_match:
+            idx = int(step_match.group(1))
+            if 0 <= idx < n_steps:
+                codes = re.findall(r"\b\d+\.\d+\b", step_match.group(2))
+                valid = [c for c in codes if c in FAILURE_MODES]
+                if valid:
+                    result.setdefault(str(idx), []).extend(valid)
+
+    return {k: sorted(set(v)) for k, v in result.items()}
+
+
+# ── Combined judge+locate prompt (single-call design) ────────────────────────
+
+def _format_steps_with_pct(steps: list[dict]) -> str:
+    """Format steps annotated with their position as % through the trace."""
+    n = len(steps)
+    parts = []
+    for i, step in enumerate(steps):
+        idx   = step.get("metadata", {}).get("step_index", i)
+        pct   = round(100 * i / max(n - 1, 1))
+        agent = step.get("agent", "Unknown")
+        content = step.get("content", "")
+        parts.append(f"[Step {idx} | {pct}%] {agent}:\n{content}")
+    return "\n\n".join(parts) + "\n"
+
+
+def build_judge_locate_prompt(steps: list[dict], definitions: str) -> str:
+    """
+    Single-call combined judge + forced localizer.
+
+    The model detects which failure modes are present AND locates the step
+    where each occurs, reported as a percentage through the trace.
+    Global modes (1.1, 1.5, 3.1) are trace-level and output 'global'.
+    All other present modes must commit to a specific step — no hedging.
+    """
+    steps_text = _format_steps_with_pct(steps)
+    n_steps = len(steps)
+
+    modes_block = "\n".join(f"  {m}" for m in _FAILURE_MODES_NAMED)
+
+    return f"""You are evaluating a multi-agent system (MAS) trace for failure modes.
+
+Each step is annotated with its position as a percentage through the trace (e.g. [Step 14 | 23%]).
+
+=== TRACE ({n_steps} steps) ===
+{steps_text}
+
+=== FAILURE MODE DEFINITIONS ===
+{definitions}
+
+=== TASK ===
+For each of the 14 failure modes below, decide whether it is present in this trace.
+- If absent → output:  <code>: absent
+- If present at a specific step → output:  <code>: step <index> (<pct>%)
+- If present as a global trace property (only 1.1, 1.5, 3.1 may use this) → output:  <code>: global
+
+Rules:
+1. Output exactly 14 lines, one per mode, in order.
+2. If a mode is present, you MUST commit to the single most representative step. No hedging.
+3. Modes 1.1, 1.5, and 3.1 are trace-level properties — if present, output "global" (never a step index).
+4. All other modes require a specific step index if present.
+5. Use the step index and percentage exactly as shown in the trace header, e.g. "step 14 (23%)".
+
+Failure modes:
+{modes_block}
+
+Output:"""
+
+
+def parse_judge_locate_response(
+    response: str, n_steps: int
+) -> dict[str, dict]:
+    """
+    Parse combined judge+locate response.
+
+    Returns:
+        {mode: {'present': bool, 'step_idx': int|None, 'pct': float|None, 'is_global': bool}}
+    Modes missing from the response are recorded as present=False.
+    """
+    result: dict[str, dict] = {}
+
+    for line in response.splitlines():
+        line = line.strip().strip("*").strip()
+        m = re.search(r"(\d+\.\d+)[^:\n]*:\s*(.*)", line)
+        if not m:
+            continue
+        code = m.group(1).strip()
+        if code not in FAILURE_MODES:
+            continue
+        val = m.group(2).strip().strip("*").strip()
+
+        if re.search(r"\babsent\b", val, re.IGNORECASE):
+            result[code] = {"present": False, "step_idx": None, "pct": None, "is_global": False}
+        elif re.search(r"\bglobal\b", val, re.IGNORECASE):
+            result[code] = {"present": True, "step_idx": None, "pct": None, "is_global": True}
+        else:
+            step_m = re.search(r"step\s+(\d+)", val, re.IGNORECASE)
+            pct_m  = re.search(r"(\d+(?:\.\d+)?)\s*%", val)
+            if step_m:
+                idx = int(step_m.group(1))
+                pct = float(pct_m.group(1)) if pct_m else None
+                valid = 0 <= idx < n_steps
+                result[code] = {
+                    "present":   True,
+                    "step_idx":  idx if valid else None,
+                    "pct":       pct,
+                    "is_global": False,
+                }
+
+    # Fill any modes the model omitted
+    for code in FAILURE_MODES:
+        if code not in result:
+            result[code] = {"present": False, "step_idx": None, "pct": None, "is_global": False}
+
+    return result
+
+
+# ── Batch localizer prompts (judge-then-batch design) ────────────────────────
+# After a shared judge call identifies which modes are present, these prompts
+# localize ALL detected modes in a single call — one for Forced, one for Semi-Forced.
+
+
+def build_forced_batch_prompt(
+    present_modes: list[str],
+    steps: list[dict],
+    definitions: str,
+) -> str:
+    """
+    FORCED batch localizer (1 call for all judge-confirmed modes).
+
+    The judge already confirmed these modes are present. The model must output
+    step coordinate(s) for each — no escape, no hedging.
+    """
+    steps_text = _format_steps(steps)
+    name_map = {n.split()[0]: n for n in _FAILURE_MODES_NAMED}
+
+    mode_list = "\n".join(f"  • {name_map.get(m, m)}" for m in present_modes)
+    output_template = "\n".join(
+        f"{name_map.get(m, m)}: global"
+        if m in GLOBAL_MODES else
+        f"{name_map.get(m, m)}: <step index(es) or range X-Y>"
+        for m in present_modes
+    )
+
+    return (
+        "STEP LOCALISATION — CONFIRMED FAILURE MODES\n\n"
+        "A full-trace evaluation confirmed that the following failure modes are present. "
+        "Identify the exact step(s) where each one occurs in the trace below.\n\n"
+        "Do not question whether a mode is present — it has been confirmed. "
+        "Commit to step coordinate(s) for every mode listed. "
+        "For trace-level modes (1.1, 1.5, 3.1) output 'global' instead of a step number.\n\n"
+        f"Confirmed modes:\n{mode_list}\n\n"
+        f"TRACE:\n{steps_text}\n"
+        f"DEFINITIONS:\n{definitions}\n\n"
+        "Output between @@ markers, one line per mode (replace placeholders with actual values):\n"
+        "@@\n"
+        f"{output_template}\n"
+        "@@"
+    )
+
+
+def build_semi_forced_batch_prompt(
+    present_modes: list[str],
+    steps: list[dict],
+    definitions: str,
+) -> str:
+    """
+    SEMI-FORCED batch localizer (1 call for all judge-flagged modes).
+
+    The judge flagged these modes as likely present. The model inspects step by step
+    and may confirm + locate, or retract via NO_STEP_FOUND if evidence is absent.
+    """
+    steps_text = _format_steps(steps)
+    name_map = {n.split()[0]: n for n in _FAILURE_MODES_NAMED}
+
+    mode_list = "\n".join(f"  • {name_map.get(m, m)}" for m in present_modes)
+    output_template = "\n".join(
+        f"{name_map.get(m, m)}: <global or NO_STEP_FOUND>"
+        if m in GLOBAL_MODES else
+        f"{name_map.get(m, m)}: <step index(es), range X-Y, or NO_STEP_FOUND>"
+        for m in present_modes
+    )
+
+    return (
+        "STEP LOCALISATION — FLAGGED FAILURE MODES\n\n"
+        "A full-trace evaluation flagged the following failure modes as likely present. "
+        "Inspect the trace step by step for each:\n"
+        "  • If confirmed present: output the step index(es), or 'global' for trace-level modes.\n"
+        "  • If step-level evidence does NOT support the flag: output NO_STEP_FOUND.\n\n"
+        f"Flagged modes:\n{mode_list}\n\n"
+        f"TRACE:\n{steps_text}\n"
+        f"DEFINITIONS:\n{definitions}\n\n"
+        "Output between @@ markers, one line per mode (replace placeholders with actual values):\n"
+        "@@\n"
+        f"{output_template}\n"
+        "@@"
+    )
+
+
+def parse_batch_localise_response(response: str, n_steps: int) -> dict[str, dict]:
+    """
+    Parse a FORCED or SEMI-FORCED batch localization response.
+
+    Returns:
+        dict[mode_code → {'steps': list[int]|'global'|None, 'retracted': bool}]
+
+    'steps' is None when the model output NO_STEP_FOUND (retracted=True).
+    Only modes present in the response are included.
+    """
+    result: dict[str, dict] = {}
+
+    cleaned = response.strip()
+    inner = re.search(r"@@\s*(.*?)\s*@@", cleaned, re.DOTALL)
+    if inner:
+        cleaned = inner.group(1)
+
+    for line in cleaned.splitlines():
+        line = line.strip()
+        m = re.search(r"(\d+\.\d+)\s+[^:]*:\s*(.*)", line)  # re.search handles markdown prefixes
+        if not m:
+            continue
+        mode = m.group(1)
+        if mode not in FAILURE_MODES:
+            continue
+        val = m.group(2).strip().strip("*").strip()  # strip trailing ** from bold markdown
+
+        if re.search(r"NO_STEP_FOUND", val, re.IGNORECASE):
+            result[mode] = {"steps": None, "retracted": True}
+        elif re.search(r"\bglobal\b", val, re.IGNORECASE):
+            result[mode] = {"steps": "global", "retracted": False}
+        else:
+            range_m = re.search(r"(\d+)\s*[-–]\s*(\d+)", val)
+            if range_m:
+                lo, hi = int(range_m.group(1)), int(range_m.group(2))
+                steps_: list | str = sorted(s for s in range(lo, hi + 1) if 0 <= s < n_steps)
+            else:
+                nums = [int(n) for n in re.findall(r"\d+", val)]
+                steps_ = sorted({n for n in nums if 0 <= n < n_steps})
+            result[mode] = {"steps": steps_, "retracted": False}
+
+    return result
+
+
+# ── Full-trace framework prompts (3-call design) ──────────────────────────────
+# One LLM call per framework; each call covers all 14 failure modes at once.
+# The three frameworks differ in how much guidance/constraint the model receives.
+
+
+def build_forced_full_prompt(steps: list[dict], definitions: str) -> str:
+    """
+    FORCED full-trace localizer (1 call, all 14 modes).
+
+    Model receives the trace + definitions + mode checklist and must commit
+    to a verdict + step(s) for every mode. No escape hatch.
+    """
+    steps_text = _format_steps(steps)
+    return (
+        "FORENSIC TRACE ANALYSIS — FULL-TRACE FAILURE MODE LOCALISATION\n\n"
+        "Analyze the multi-agent trace below for all 14 MAST failure modes.\n\n"
+        "For EVERY mode you must:\n"
+        "  1. Decide if it is present (yes or no).\n"
+        "  2. If yes: output the exact step index(es) where it occurs, or 'global' "
+        "for trace-level modes (1.1, 1.5, 3.1).\n"
+        "  3. If no: output 'n/a' for steps.\n\n"
+        "Do not hedge. Commit to a verdict for every single mode.\n\n"
+        f"TRACE:\n{steps_text}\n"
+        f"FAILURE MODE DEFINITIONS:\n{definitions}\n\n"
+        "Output your verdicts between @@ markers, one line per mode:\n\n"
+        "@@\n"
+        "1.1 Disobey Task Specification: <yes or no>; steps: <step index(es), 'global', or 'n/a'>\n"
+        "1.2 Disobey Role Specification: <yes or no>; steps: <step index(es) or 'n/a'>\n"
+        "1.3 Step Repetition: <yes or no>; steps: <step index(es) or 'n/a'>\n"
+        "1.4 Loss of Conversation History: <yes or no>; steps: <step index(es) or 'n/a'>\n"
+        "1.5 Unaware of Termination Conditions: <yes or no>; steps: <'global' or 'n/a'>\n"
+        "2.1 Conversation Reset: <yes or no>; steps: <step index(es) or 'n/a'>\n"
+        "2.2 Fail to Ask for Clarification: <yes or no>; steps: <step index(es) or 'n/a'>\n"
+        "2.3 Task Derailment: <yes or no>; steps: <step index(es) or 'n/a'>\n"
+        "2.4 Information Withholding: <yes or no>; steps: <step index(es) or 'n/a'>\n"
+        "2.5 Ignored Other Agent's Input: <yes or no>; steps: <step index(es) or 'n/a'>\n"
+        "2.6 Action-Reasoning Mismatch: <yes or no>; steps: <step index(es) or 'n/a'>\n"
+        "3.1 Premature Termination: <yes or no>; steps: <'global' or 'n/a'>\n"
+        "3.2 No or Incomplete Verification: <yes or no>; steps: <step index(es) or 'n/a'>\n"
+        "3.3 Incorrect Verification: <yes or no>; steps: <step index(es) or 'n/a'>\n"
+        "@@"
+    )
+
+
+def build_semi_forced_full_prompt(steps: list[dict], definitions: str) -> str:
+    """
+    SEMI-FORCED full-trace localizer (1 call, all 14 modes).
+
+    Same checklist as FORCED but the model may output NO_STEP_FOUND per mode
+    if it genuinely does not observe evidence for that mode.
+    """
+    steps_text = _format_steps(steps)
+    return (
+        "STEP-LEVEL FAILURE MODE ANALYSIS\n\n"
+        "Analyze the multi-agent trace below for all 14 MAST failure modes.\n\n"
+        "For each mode:\n"
+        "  • If it IS present: output 'yes' and the exact step index(es), or 'global' "
+        "for trace-level modes (1.1, 1.5, 3.1).\n"
+        "  • If it is NOT present after careful inspection: output NO_STEP_FOUND.\n\n"
+        "You are not required to find every mode. Only flag what you genuinely observe.\n\n"
+        f"TRACE:\n{steps_text}\n"
+        f"FAILURE MODE DEFINITIONS:\n{definitions}\n\n"
+        "Output your verdicts between @@ markers, one line per mode:\n\n"
+        "@@\n"
+        "1.1 Disobey Task Specification: <yes or NO_STEP_FOUND>; steps: <step index(es), 'global', or 'n/a'>\n"
+        "1.2 Disobey Role Specification: <yes or NO_STEP_FOUND>; steps: <step index(es) or 'n/a'>\n"
+        "1.3 Step Repetition: <yes or NO_STEP_FOUND>; steps: <step index(es) or 'n/a'>\n"
+        "1.4 Loss of Conversation History: <yes or NO_STEP_FOUND>; steps: <step index(es) or 'n/a'>\n"
+        "1.5 Unaware of Termination Conditions: <yes or NO_STEP_FOUND>; steps: <'global' or 'n/a'>\n"
+        "2.1 Conversation Reset: <yes or NO_STEP_FOUND>; steps: <step index(es) or 'n/a'>\n"
+        "2.2 Fail to Ask for Clarification: <yes or NO_STEP_FOUND>; steps: <step index(es) or 'n/a'>\n"
+        "2.3 Task Derailment: <yes or NO_STEP_FOUND>; steps: <step index(es) or 'n/a'>\n"
+        "2.4 Information Withholding: <yes or NO_STEP_FOUND>; steps: <step index(es) or 'n/a'>\n"
+        "2.5 Ignored Other Agent's Input: <yes or NO_STEP_FOUND>; steps: <step index(es) or 'n/a'>\n"
+        "2.6 Action-Reasoning Mismatch: <yes or NO_STEP_FOUND>; steps: <step index(es) or 'n/a'>\n"
+        "3.1 Premature Termination: <yes or NO_STEP_FOUND>; steps: <'global' or 'n/a'>\n"
+        "3.2 No or Incomplete Verification: <yes or NO_STEP_FOUND>; steps: <step index(es) or 'n/a'>\n"
+        "3.3 Incorrect Verification: <yes or NO_STEP_FOUND>; steps: <step index(es) or 'n/a'>\n"
+        "@@"
+    )
+
+
+def build_relaxed_full_prompt(steps: list[dict]) -> str:
+    """
+    RELAXED full-trace localizer (1 call, no FM list or definitions).
+
+    Model sees only the numbered trace and is asked to identify MAST failure modes
+    using its own knowledge. No checklist, no definitions, no nudging.
+    """
+    steps_text = _format_steps(steps)
+    return (
+        "STEP-LEVEL FAILURE MODE ANALYSIS\n\n"
+        "Below is a multi-agent system trace with numbered steps. "
+        "Using your knowledge of the MAST (Multi-Agent System Taxonomy) failure mode "
+        "framework, identify any failure modes you observe (codes 1.1–3.3).\n\n"
+        "For each step where you detect a failure mode, output:\n"
+        "  Step X: <mode code> <mode name>\n"
+        "For failure modes that apply to the whole trace (global properties), output:\n"
+        "  GLOBAL: <mode code> <mode name>\n"
+        "Omit steps where no failure mode is detected.\n\n"
+        f"TRACE:\n{steps_text}\n"
+        "Flagged steps:"
+    )
+
+
+def parse_full_framework_response(response: str, n_steps: int) -> dict[str, dict]:
+    """
+    Parse a FORCED or SEMI-FORCED full-trace response.
+
+    Returns:
+        dict[mode_code → {'present': 0|1, 'steps': list[int]|'global', 'retracted': bool}]
+
+    'retracted' is True when the model output NO_STEP_FOUND (semi-forced only).
+    """
+    result: dict[str, dict] = {}
+
+    cleaned = response.strip()
+    # unwrap @@ block if present
+    inner = re.search(r"@@\s*(.*?)\s*@@", cleaned, re.DOTALL)
+    if inner:
+        cleaned = inner.group(1)
+
+    for mode in FAILURE_MODES:
+        # NO_STEP_FOUND check (semi-forced retraction)
+        if re.search(
+            rf"{re.escape(mode)}\b[^@\n]*?NO_STEP_FOUND",
+            cleaned,
+            re.IGNORECASE,
+        ):
+            result[mode] = {"present": 0, "steps": [], "retracted": True}
+            continue
+
+        # "1.1 Name: yes; steps: 3, 5"
+        match = re.search(
+            rf"{re.escape(mode)}\b[^:]*:\s*(yes|no)\s*[;,]?\s*steps?\s*[:\-]?\s*([^\n@@]*)",
+            cleaned,
+            re.IGNORECASE,
+        )
+        if match:
+            present = 1 if match.group(1).strip().lower() == "yes" else 0
+            steps_str = match.group(2).strip().lower()
+
+            if "global" in steps_str:
+                steps: list | str = "global"
+            elif not present or "n/a" in steps_str or not steps_str:
+                steps = []
+            else:
+                nums = [int(n) for n in re.findall(r"\d+", steps_str)]
+                steps = sorted({n for n in nums if 0 <= n < n_steps})
+
+            result[mode] = {"present": present, "steps": steps, "retracted": False}
+        else:
+            result[mode] = {"present": 0, "steps": [], "retracted": False}
+
+    return result
 
 
 def _stratified_sample(data: list[dict], n: int, key: str, seed: int = 42) -> list[dict]:

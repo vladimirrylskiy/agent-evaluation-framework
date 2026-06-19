@@ -2,7 +2,7 @@ BELOW ARE THE EXAMPLES OF DIFFERENT FAILURE MODES OF MULTIAGENT SYSTEMS. THE FAI
 
 
 ######################################
-### No or Incorrect Verification ###
+### No or Incomplete Verification ###
 The following trace is problematic because there is no verification of the result. The generated code is incorrect, and the reviewer did not check the result or ran any tests it should have ran.
 
 
@@ -171,7 +171,7 @@ The following trace is problematic because there is no verification of the resul
     ]
 
 ######################################
-### Weak Verification ###
+### Incorrect Verification ###
 
 
 The example below is a trace from the code review phase. The reviewer did not check the logic of the code and only reviewed the code superficially. This resulted in a critical bug in the code and that the generated code did not give a good application. The verifier was there but did not provide any insightful feedback, did not run the proper unit tests or check for task constraint satisfaction.
@@ -987,7 +987,7 @@ Unimplemented File:
 
 
 ########################################
-### Ignoring Other Agent's Suggestions ###
+### Ignored Other Agent's Input ###
 
 {
     "content": [
