@@ -126,7 +126,26 @@ with st.sidebar:
     st.divider()
     if st.button("📊 Run Partial-Trace Detection", use_container_width=True):
         st.session_state.active_panel = "partial"
-    st.caption("Runs the judge on 25 %, 50 %, 75 %, 100 % prefixes (3 extra calls). Uses the selected model.")
+    st.caption("Runs judge at 25 %, 50 %, 75 %, and 100 % prefixes. Shows when each FM first appears and whether the verdict is stable.")
+    st.divider()
+    if st.button("🔬 Run Slice Detection", use_container_width=True):
+        st.session_state.active_panel = "slice"
+    st.caption("Run judge on any contiguous window of the trace (e.g. last 50 %, or steps 25 %–75 %).")
+    _n_steps_sidebar = len(all_traces[selected_idx]["steps"])
+    slice_range = st.slider(
+        "Trace window (%)",
+        min_value=0, max_value=100,
+        value=(50, 100), step=5,
+        help=f"Trace has {_n_steps_sidebar} steps. Drag to select start and end %.",
+        key="slice_range",
+    )
+    _s = round(_n_steps_sidebar * slice_range[0] / 100)
+    _e = round(_n_steps_sidebar * slice_range[1] / 100)
+    st.caption(f"Steps {_s}–{_e} of {_n_steps_sidebar} ({_e - _s} steps)")
+    st.divider()
+    if st.button("📈 Batch Slice Analysis", use_container_width=True):
+        st.session_state.active_panel = "batch_slice"
+    st.caption("Run slice detection across N traces and get an FM prevalence table.")
     st.divider()
     if st.button("🧑 Human-Label Validation", use_container_width=True):
         st.session_state.active_panel = "human_val"
@@ -138,6 +157,8 @@ with st.sidebar:
 
 run_judge = st.session_state.active_panel == "judge"
 run_partial = st.session_state.active_panel == "partial"
+run_slice = st.session_state.active_panel == "slice"
+run_batch_slice = st.session_state.active_panel == "batch_slice"
 run_human_val = st.session_state.active_panel == "human_val"
 run_framework_compare = st.session_state.active_panel == "framework_compare"
 
@@ -166,7 +187,7 @@ with col1:
 with col2:
     st.subheader("🎯 Judge Results")
     
-    if not run_judge and not run_partial and not run_human_val and not run_framework_compare:
+    if not run_judge and not run_partial and not run_slice and not run_batch_slice and not run_human_val and not run_framework_compare:
         st.info("Configure and click a button in the sidebar to see results.")
     elif run_judge:
         with st.spinner("Running judge (this may take a moment)..."):
@@ -337,7 +358,7 @@ with col2:
 
     if run_partial:
         st.markdown("---")
-        st.subheader("3️⃣ Partial-Trace Detection")
+        st.subheader("📊 Partial-Trace Detection")
         st.caption(
             "The judge runs on growing prefixes of the trace (25 %, 50 %, 75 %, 100 %). "
             "The 100 % run is the reference verdict. For each failure mode, the table shows "
@@ -388,8 +409,6 @@ with col2:
             progress_bar.progress(1.0, text="Done.")
             progress_bar.empty()
 
-            # Build results table
-            ref = verdicts_by_frac.get(1.00, {})
             rows_partial = []
             present_modes = []
 
@@ -412,7 +431,6 @@ with col2:
 
                 rows_partial.append(row)
 
-            # Render markdown table
             header = "| FM | 25% | 50% | 75% | 100% | First detected | Stable from | Stable? |"
             sep    = "|---|---|---|---|---|---|---|---|"
             lines  = [header, sep]
@@ -425,12 +443,9 @@ with col2:
                 )
             st.markdown("\n".join(lines))
 
-            # Headline summary
-            n_present = len(present_modes)
             present_rows = [r for r in rows_partial if r["Stable?"] != "absent"]
             n_early = sum(1 for r in present_rows if r["First detected"] == "25%")
             n_unstable = sum(1 for r in present_rows if r["Stable?"] == "unstable")
-
             st.write(
                 f"**Present modes at 100 %:** {', '.join(present_modes) if present_modes else 'none'}. "
                 f"Of these, **{n_early}** first detected at 25 %, **{n_unstable}** unstable across prefixes."
@@ -440,6 +455,223 @@ with col2:
             st.error(f"Partial-trace error: {e}")
             import traceback
             st.code(traceback.format_exc())
+
+    if run_slice:
+        st.markdown("---")
+        st.subheader("🔬 Slice Detection")
+        pct_start, pct_end = st.session_state.get("slice_range", (50, 100))
+        n_steps = len(selected_trace["steps"])
+        idx_start = round(n_steps * pct_start / 100)
+        idx_end   = round(n_steps * pct_end   / 100)
+        idx_end   = max(idx_end, idx_start + 1)  # at least 1 step
+
+        st.caption(
+            f"Running judge on steps **{idx_start}–{idx_end - 1}** "
+            f"({idx_end - idx_start} of {n_steps} steps, "
+            f"{pct_start} %–{pct_end} % of trace)."
+        )
+
+        try:
+            steps_slice = selected_trace["steps"][idx_start:idx_end]
+            trace_text_slice = steps_to_text(steps_slice)
+
+            # Tell the model it is seeing a deliberate slice so it can correctly
+            # evaluate 3.1 (Premature Termination) — without this note the model
+            # has no way to know the trace ends abruptly on purpose vs. naturally.
+            slice_note = (
+                f"[ANALYSIS CONTEXT: You are evaluating steps {idx_start}–{idx_end - 1} "
+                f"of a {n_steps}-step trace ({pct_start}%–{pct_end}% of the full conversation). "
+                f"The trace ends at step {idx_end - 1}. "
+                f"Treat this endpoint as the actual end of the conversation for your evaluation — "
+                f"if the task appears unfinished or incomplete at this point, "
+                f"flag Premature Termination (3.1) as present.]\n\n"
+            )
+            trace_text_slice = slice_note + trace_text_slice
+
+            defs_path_s  = Path("data/prompts/definitions.txt")
+            examples_path_s = Path("data/prompts/examples.txt")
+            definitions_s = defs_path_s.read_text() if defs_path_s.exists() else ""
+            examples_s    = examples_path_s.read_text() if examples_path_s.exists() else ""
+
+            config_s = JudgeConfig(
+                name=f"slice_{pct_start}_{pct_end}_{datetime.now().isoformat()}",
+                model=model,
+                backend=backend,
+                temperature=0.0,
+                definitions_path=str(defs_path_s),
+                examples_path=str(examples_path_s),
+            )
+            judge_s = LLMJudge(config_s)
+
+            with st.spinner(f"Running judge on {pct_start}%–{pct_end}% slice…"):
+                prompt_s = build_judge_prompt(trace_text_slice, definitions_s, examples_s)
+                resp_s   = judge_s._dispatch(prompt_s, f"slice_{idx_start}_{idx_end}")
+                verdicts_s = parse_14_modes(resp_s.raw_text)
+
+            # FM name lookup
+            _fm_names = {
+                "1.1": "Disobey Task Specification",
+                "1.2": "Disobey Role Specification",
+                "1.3": "Step Repetition",
+                "1.4": "Loss of Conversation History",
+                "1.5": "Unaware of Termination Conditions",
+                "2.1": "Conversation Reset",
+                "2.2": "Fail to Ask for Clarification",
+                "2.3": "Task Derailment",
+                "2.4": "Information Withholding",
+                "2.5": "Ignored Other Agent's Input",
+                "2.6": "Action-Reasoning Mismatch",
+                "3.1": "Premature Termination",
+                "3.2": "No or Incomplete Verification",
+                "3.3": "Incorrect Verification",
+            }
+
+            present = [m for m in FAILURE_MODES if verdicts_s.get(m) == 1]
+
+            # Render markdown table
+            header = "| FM | Failure Mode | Verdict |"
+            sep    = "|:---:|:---|:---:|"
+            lines  = [header, sep]
+            for m in FAILURE_MODES:
+                v = verdicts_s.get(m, -1)
+                verdict = "✅ present" if v == 1 else ("❌ absent" if v == 0 else "?")
+                lines.append(f"| {m} | {_fm_names.get(m, m)} | {verdict} |")
+            st.markdown("\n".join(lines))
+
+            n_present = len(present)
+            st.write(
+                f"**{n_present} mode(s) detected** in steps {idx_start}–{idx_end - 1} "
+                f"({pct_start}%–{pct_end}% of trace): "
+                + (", ".join(present) if present else "none")
+            )
+
+            with st.expander("🔧 Raw LLM response"):
+                st.code(resp_s.raw_text)
+
+            st.success("✅ Slice detection complete!")
+
+        except Exception as e:
+            st.error(f"Slice detection error: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+
+    if run_batch_slice:
+        st.markdown("---")
+        st.subheader("📈 Batch Slice Analysis")
+
+        _fm_names_batch = {
+            "1.1": "Disobey Task Specification",
+            "1.2": "Disobey Role Specification",
+            "1.3": "Step Repetition",
+            "1.4": "Loss of Conversation History",
+            "1.5": "Unaware of Termination Conditions",
+            "2.1": "Conversation Reset",
+            "2.2": "Fail to Ask for Clarification",
+            "2.3": "Task Derailment",
+            "2.4": "Information Withholding",
+            "2.5": "Ignored Other Agent's Input",
+            "2.6": "Action-Reasoning Mismatch",
+            "3.1": "Premature Termination",
+            "3.2": "No or Incomplete Verification",
+            "3.3": "Incorrect Verification",
+        }
+
+        col_ctrl1, col_ctrl2 = st.columns(2)
+        with col_ctrl1:
+            n_traces_batch = st.number_input(
+                "Number of traces", min_value=1,
+                max_value=len(all_traces), value=min(10, len(all_traces)),
+                step=1, key="batch_n_traces",
+            )
+        with col_ctrl2:
+            batch_slice_range = st.slider(
+                "Trace window (%)", 0, 100, (0, 50), step=5,
+                key="batch_slice_range",
+            )
+
+        pct_b_start, pct_b_end = batch_slice_range
+        st.caption(
+            f"Will run judge on the **{pct_b_start}%–{pct_b_end}%** window of "
+            f"**{n_traces_batch}** {framework} traces ({n_traces_batch} LLM calls)."
+        )
+
+        if st.button("▶ Run Batch", key="run_batch_btn"):
+            try:
+                defs_path_b   = Path("data/prompts/definitions.txt")
+                examples_path_b = Path("data/prompts/examples.txt")
+                definitions_b = defs_path_b.read_text() if defs_path_b.exists() else ""
+                examples_b    = examples_path_b.read_text() if examples_path_b.exists() else ""
+
+                counts = {m: 0 for m in FAILURE_MODES}
+                errors = 0
+                progress = st.progress(0, text="Starting…")
+
+                for trace_i, trace in enumerate(all_traces[:n_traces_batch]):
+                    n_steps_b = len(trace["steps"])
+                    idx_s = round(n_steps_b * pct_b_start / 100)
+                    idx_e = max(round(n_steps_b * pct_b_end   / 100), idx_s + 1)
+
+                    steps_b     = trace["steps"][idx_s:idx_e]
+                    trace_text_b = steps_to_text(steps_b)
+
+                    slice_note_b = (
+                        f"[ANALYSIS CONTEXT: You are evaluating steps {idx_s}–{idx_e - 1} "
+                        f"of a {n_steps_b}-step trace ({pct_b_start}%–{pct_b_end}% of the full conversation). "
+                        f"The trace ends at step {idx_e - 1}. "
+                        f"Treat this endpoint as the actual end of the conversation — "
+                        f"if the task appears unfinished at this point, flag Premature Termination (3.1) as present.]\n\n"
+                    )
+                    trace_text_b = slice_note_b + trace_text_b
+
+                    progress.progress(
+                        trace_i / n_traces_batch,
+                        text=f"Trace {trace_i + 1}/{n_traces_batch} "
+                             f"(steps {idx_s}–{idx_e - 1} of {n_steps_b})…",
+                    )
+
+                    try:
+                        config_b = JudgeConfig(
+                            name=f"batch_{trace_i}_{datetime.now().isoformat()}",
+                            model=model, backend=backend, temperature=0.0,
+                            definitions_path=str(defs_path_b),
+                            examples_path=str(examples_path_b),
+                        )
+                        judge_b  = LLMJudge(config_b)
+                        prompt_b = build_judge_prompt(trace_text_b, definitions_b, examples_b)
+                        resp_b   = judge_b._dispatch(prompt_b, f"batch_{trace_i}")
+                        verdicts_b = parse_14_modes(resp_b.raw_text)
+                        for m in FAILURE_MODES:
+                            if verdicts_b.get(m) == 1:
+                                counts[m] += 1
+                    except Exception as e:
+                        st.warning(f"Trace {trace_i} error: {e}")
+                        errors += 1
+
+                progress.progress(1.0, text="Done.")
+                progress.empty()
+
+                # Results table
+                st.write(
+                    f"**Results:** {framework} · {n_traces_batch} traces · "
+                    f"window {pct_b_start}%–{pct_b_end}%"
+                    + (f" · {errors} error(s)" if errors else "")
+                )
+                header = "| FM | Failure Mode | Count | % of traces |"
+                sep    = "|:---:|:---|:---:|:---:|"
+                lines  = [header, sep]
+                for m in FAILURE_MODES:
+                    pct_val = round(100 * counts[m] / n_traces_batch)
+                    bar = "█" * (pct_val // 10) + "░" * (10 - pct_val // 10)
+                    lines.append(
+                        f"| {m} | {_fm_names_batch[m]} | {counts[m]} | {bar} {pct_val}% |"
+                    )
+                st.markdown("\n".join(lines))
+                st.success("✅ Batch complete!")
+
+            except Exception as e:
+                st.error(f"Batch error: {e}")
+                import traceback
+                st.code(traceback.format_exc())
 
     if run_human_val:
         st.markdown("---")

@@ -1,0 +1,20 @@
+Forced-commit → Semi-Forced-retraction experiment
+  15 traces × 3 frameworks  ·  15 repeats/trace  ·  gemini-2.5-flash  T=1.0
+
+Overall retraction rate: 17.8%
+  (143 retractions out of 801 forced-commits)
+
+Per-framework:
+  ChatDev          17.5%  (42/240)
+  HyperAgent       15.3%  (47/307)
+  MetaGPT          21.3%  (54/254)
+
+Top-5 FMs by retraction rate:
+  FM 2.5     50.0%  (1/2)
+  FM 2.3     46.8%  (29/62)
+  FM 2.4     45.5%  (5/11)
+  FM 1.2     38.2%  (13/34)
+  FM 2.1     33.3%  (12/36)
+
+Thesis sentence:
+  "Across 15 traces and 3 frameworks (MetaGPT, HyperAgent, ChatDev), the Forced localizer committed to a step that Semi-Forced subsequently retracted in 17.8% of cases (n=801 forced-commits), concentrated in modes 2.5, 2.3, 2.4, 1.2, 2.1."

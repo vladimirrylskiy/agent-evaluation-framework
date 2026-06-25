@@ -1,0 +1,30 @@
+
+==============================================================
+  Retraction-rate experiment
+  15 traces  ×  15 repeats  ×  ~4 calls  = ~900 API calls
+  Model: gemini-2.5-flash  backend: genai  T=1.0
+  Est. cost: ~$3.6  |  Est. time: ~90 min
+==============================================================
+
+
+[1/15]  MetaGPT  trace_idx=0  (6 steps)
+/Users/vladimir/anaconda3/lib/python3.11/site-packages/google/auth/_default.py:113: UserWarning: Your application has authenticated using end user credentials from Google Cloud SDK without a quota project. You might receive a "quota exceeded" or "API not enabled" error. See the following page for troubleshooting: https://cloud.google.com/docs/authentication/adc-troubleshooting/user-creds. 
+  warnings.warn(_CLOUD_SDK_CREDENTIALS_WARNING)
+No credentials found, authenticating...
+Streamlit secrets auth failed: No secrets found. Valid paths for a secrets.toml file or secret directories are: /Users/vladimir/.streamlit/secrets.toml, /Users/vladimir/IKEA_MAST_thesis/agent-evaluation-framework/.streamlit/secrets.toml
+Authenticated with default credentials 
+Refreshing credentials...
+Using cached credentials
+Using cached credentials
+Using cached credentials
+  repeat  1/15  judge=1 present  retracts=0  56.2s  calls=4  ~896 left
+Using cached credentials
+Using cached credentials
+Using cached credentials
+Using cached credentials
+  repeat  2/15  judge=1 present  retracts=0  84.5s  calls=8  ~892 left
+Using cached credentials
+Using cached credentials
+Using cached credentials
+Using cached credentials
+  repeat  3/15  judge=2 present  retracts=0  114.1s  calls=12  ~888 left
